@@ -228,6 +228,10 @@ function renderStatus(status, warpSwitch) {
 			E('td', { 'class': 'td' }, t.profile || ''),
 			E('td', { 'class': 'td' }, [
 				sitesCell(t.sites),
+				t.reconnects ? E('div', {
+					'style': 'color:#888;font-size:90%',
+					'title': _('Провайдер обрывает длинные UDP-потоки WARP; FlowCloud замечает обрыв за пару секунд и переподключается к тому же серверу с нового порта.')
+				}, _('переподключений: %d').format(t.reconnects)) : '',
 				t.quality ? E('div', { 'style': 'color:#c98a14' }, t.quality) : '',
 				t.error ? E('div', { 'style': 'color:#c94141' }, t.error) : ''
 			]),

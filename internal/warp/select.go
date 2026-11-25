@@ -47,6 +47,9 @@ type Selection struct {
 	SitesOK    int
 	SitesTotal int
 	SiteErrors []string
+	// Alternates back the winner up, best first. SitesOK -1 marks one that
+	// answered the ping but was not site-tested.
+	Alternates []Selection
 }
 
 // Options tune a selection round.
@@ -204,8 +207,13 @@ func Select(ctx context.Context, peer *Peer, cache *EndpointCache, opts Options)
 	perfect := func(selection Selection) bool {
 		return selection.SitesOK == selection.SitesTotal && !avoided(selection.Colo, opts.AvoidColos)
 	}
+	var evaluated []Selection
+	// pending are candidates that passed a ping but were not site-tested
+	// because an earlier one won; they back the winner up.
+	var pending []warpCandidate
 	consider := func(selection Selection) {
 		cache.noteColo(selection.Endpoint, selection.Colo)
+		evaluated = append(evaluated, selection)
 		if !found || betterSelection(selection, best, opts.AvoidColos) {
 			best, found = selection, true
 		}
@@ -213,6 +221,7 @@ func Select(ctx context.Context, peer *Peer, cache *EndpointCache, opts Options)
 	finish := func() (Selection, error) {
 		best.Latency = time.Since(started)
 		cache.rememberSelection(best)
+		best.Alternates = alternates(best, evaluated, pending, cache, opts.AvoidColos)
 		return best, nil
 	}
 
@@ -220,12 +229,19 @@ func Select(ctx context.Context, peer *Peer, cache *EndpointCache, opts Options)
 	// avoided locations. Usually the first one still does.
 	tried := map[string]bool{}
 	fast := 0
+	var good []cachedEndpoint
 	for _, entry := range cache.snapshot() {
+		if entry.Sites && !avoided(entry.Colo, opts.AvoidColos) && entry.Endpoint != opts.Exclude {
+			good = append(good, entry)
+		}
+	}
+	for index, entry := range good {
 		if fast == fastPathTries || ctx.Err() != nil {
 			break
 		}
-		if !entry.Sites || avoided(entry.Colo, opts.AvoidColos) || entry.Endpoint == opts.Exclude {
-			continue
+		pending = pending[:0]
+		for _, rest := range good[index+1:] {
+			pending = append(pending, warpCandidate{rest.Endpoint, rest.Profile, sourceCached})
 		}
 		fast++
 		tried[entry.Endpoint] = true
@@ -259,9 +275,15 @@ func Select(ctx context.Context, peer *Peer, cache *EndpointCache, opts Options)
 	// An endpoint in an avoided location skips the site test while other
 	// candidates remain: a blocked site costs a full timeout each time.
 	var deferred []warpCandidate
-	for _, entry := range shortlist {
+	for index, entry := range shortlist {
 		if ctx.Err() != nil {
 			return Selection{}, ctx.Err()
+		}
+		pending = pending[:0]
+		for _, rest := range shortlist[index+1:] {
+			if !avoided(cache.poolColo(rest.candidate.endpoint), opts.AvoidColos) {
+				pending = append(pending, rest.candidate)
+			}
 		}
 		selection, skipped, err := evaluate(ctx, peer, entry.candidate, opts, addresses, true)
 		if err != nil {
@@ -278,6 +300,7 @@ func Select(ctx context.Context, peer *Peer, cache *EndpointCache, opts Options)
 		}
 	}
 	// Nothing outside the avoided locations opened every site: test those.
+	pending = nil
 	for _, candidate := range deferred {
 		if ctx.Err() != nil {
 			return Selection{}, ctx.Err()
@@ -294,6 +317,42 @@ func Select(ctx context.Context, peer *Peer, cache *EndpointCache, opts Options)
 		return Selection{}, errors.New("no WARP endpoint passed the second check")
 	}
 	return finish()
+}
+
+// maxAlternates bounds the backups returned with a winner.
+const maxAlternates = 3
+
+// alternates lists backups for best: evaluated endpoints that opened as many
+// sites, then pinged ones not tested yet. When the winner carries no traffic
+// once applied to the tunnel, the daemon tries these before a new round.
+func alternates(best Selection, evaluated []Selection, pending []warpCandidate, cache *EndpointCache, avoid []string) []Selection {
+	var result []Selection
+	sorted := append([]Selection(nil), evaluated...)
+	sort.SliceStable(sorted, func(i, j int) bool { return betterSelection(sorted[i], sorted[j], avoid) })
+	seen := map[string]bool{best.Endpoint: true}
+	for _, selection := range sorted {
+		if len(result) == maxAlternates {
+			return result
+		}
+		if seen[selection.Endpoint] || selection.SitesOK < best.SitesOK {
+			continue
+		}
+		seen[selection.Endpoint] = true
+		selection.Alternates = nil
+		result = append(result, selection)
+	}
+	for _, candidate := range pending {
+		if len(result) == maxAlternates {
+			break
+		}
+		if seen[candidate.endpoint] {
+			continue
+		}
+		seen[candidate.endpoint] = true
+		result = append(result, Selection{Endpoint: candidate.endpoint, Profile: candidate.profile,
+			Source: string(candidate.source), Colo: cache.poolColo(candidate.endpoint), SitesOK: -1, SitesTotal: best.SitesTotal})
+	}
+	return result
 }
 
 // pingStage returns up to shortlistSize candidates that passed the ping,
@@ -318,6 +377,22 @@ func pingStage(ctx context.Context, peer *Peer, cache *EndpointCache, opts Optio
 	if len(candidates) == 0 {
 		return nil, errors.New("no WARP endpoint candidates")
 	}
+	// Pools seen exiting outside the avoided locations are pinged first, so
+	// the shortlist rarely holds only avoided ones; cached pairs stay first.
+	rank := func(candidate warpCandidate) int {
+		if candidate.source == sourceCached {
+			return 0
+		}
+		switch colo := cache.poolColo(candidate.endpoint); {
+		case colo == "":
+			return 2
+		case avoided(colo, opts.AvoidColos):
+			return 3
+		default:
+			return 1
+		}
+	}
+	sort.SliceStable(candidates, func(i, j int) bool { return rank(candidates[i]) < rank(candidates[j]) })
 	type result struct {
 		candidate warpCandidate
 		rtt       time.Duration

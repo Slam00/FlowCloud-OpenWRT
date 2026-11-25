@@ -7,7 +7,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -69,4 +71,23 @@ func InterfaceDevice(name string) (string, bool, error) {
 func LinkExists(device string) bool {
 	_, err := Run("ip", "link", "show", "dev", device)
 	return err == nil
+}
+
+// InterfaceBytes reads a device's received and sent byte counters from
+// sysfs: cheap enough to poll every few seconds, no process started.
+func InterfaceBytes(device string) (rx, tx uint64, ok bool) {
+	if device == "" || strings.ContainsAny(device, "/.") {
+		return 0, 0, false
+	}
+	read := func(name string) (uint64, bool) {
+		data, err := os.ReadFile("/sys/class/net/" + device + "/statistics/" + name)
+		if err != nil {
+			return 0, false
+		}
+		value, err := strconv.ParseUint(strings.TrimSpace(string(data)), 10, 64)
+		return value, err == nil
+	}
+	rx, okRx := read("rx_bytes")
+	tx, okTx := read("tx_bytes")
+	return rx, tx, okRx && okTx
 }

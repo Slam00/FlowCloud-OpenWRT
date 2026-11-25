@@ -61,9 +61,16 @@ func (k *Kernel) Ensure(peer *warp.Peer) error {
 // taking it down. The peer is removed first: a kept peer would go on sending
 // with its old session, which the new endpoint does not know, and WireGuard
 // would only start a fresh handshake after about 15 silent seconds.
+//
+// Every apply also moves the device to a new random UDP source port. The
+// ISP's DPI blocks a flow "source port -> endpoint" it once flagged: the
+// handshake still gets through, the data does not, and a new handshake on
+// the same port does not help (seen on the test router). Selection probes
+// always use fresh ports, so without this the probes pass and the tunnel
+// on its long-lived port fails.
 func (k *Kernel) Apply(peer *warp.Peer, selection warp.Selection, publicKey string) error {
 	_, _ = system.Run("awg", "set", k.Device, "peer", publicKey, "remove")
-	args := []string{"set", k.Device}
+	args := []string{"set", k.Device, "listen-port", "0"}
 	args = append(args, selection.Profile.AWGArgs()...)
 	args = append(args, "peer", publicKey, "endpoint", selection.Endpoint,
 		"allowed-ips", "0.0.0.0/0", "persistent-keepalive", "25")

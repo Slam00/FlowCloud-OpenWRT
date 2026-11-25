@@ -33,7 +33,9 @@ type TunnelStatus struct {
 	Sites     []zapret.URLResult `json:"sites,omitempty"`
 	CheckedAt int64              `json:"checked_at,omitempty"`
 	Switches  int                `json:"switches"`
-	Error     string             `json:"error,omitempty"`
+	// Reconnects counts flows revived from a new source port.
+	Reconnects int    `json:"reconnects,omitempty"`
+	Error      string `json:"error,omitempty"`
 }
 
 type SectionStatus struct {

@@ -131,3 +131,23 @@ func TestEndpointCacheKeepsColoAndSites(t *testing.T) {
 		t.Fatal("a failed site check through the tunnel must clear the flag")
 	}
 }
+
+func TestAlternatesBackUpTheWinner(t *testing.T) {
+	cache := newEndpointCache("")
+	cache.noteColo("188.114.97.11:2408", "ARN")
+	avoid := []string{"DME"}
+	best := Selection{Endpoint: "8.39.125.105:1701", Colo: "ARN", SitesOK: 2, SitesTotal: 2}
+	evaluated := []Selection{
+		best,
+		{Endpoint: "8.35.211.176:1701", Colo: "DME", SitesOK: 1, SitesTotal: 2},
+		{Endpoint: "8.47.69.173:2408", Colo: "ARN", SitesOK: 2, SitesTotal: 2},
+	}
+	pending := []warpCandidate{{endpoint: "188.114.97.11:2408"}, {endpoint: "8.39.125.105:1701"}}
+	got := alternates(best, evaluated, pending, cache, avoid)
+	if len(got) != 2 || got[0].Endpoint != "8.47.69.173:2408" || got[1].Endpoint != "188.114.97.11:2408" {
+		t.Fatalf("alternates = %+v", got)
+	}
+	if got[1].SitesOK != -1 || got[1].Colo != "ARN" {
+		t.Fatalf("an untested backup must say so and carry its pool location: %+v", got[1])
+	}
+}

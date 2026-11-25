@@ -209,16 +209,19 @@ func (d *Daemon) runWarp(ctx context.Context, t *config.Tunnel) {
 		debug.FreeOSMemory()
 		return selection, err
 	}
-	apply := func(selection warp.Selection, reason string) error {
+	applyOne := func(selection warp.Selection) error {
 		if err := kernel.Apply(peer, selection, account.PeerPublicKey); err != nil {
 			return err
 		}
 		d.setBypass(t.Name, endpointPrefixes([]string{selection.Endpoint}))
-		if err := route.SetDevice(t.Index, t.Device, t.FailClosed); err != nil {
-			return err
-		}
+		return route.SetDevice(t.Index, t.Device, t.FailClosed)
+	}
+	announce := func(selection warp.Selection, reason string) {
 		sites := ""
-		if selection.SitesTotal > 0 {
+		switch {
+		case selection.SitesOK < 0:
+			sites = ", backup without a site test"
+		case selection.SitesTotal > 0:
 			sites = fmt.Sprintf(", test sites %d/%d", selection.SitesOK, selection.SitesTotal)
 		}
 		log.Printf("tunnel %s: endpoint %s [%s %s] exit %s selected in %s, %s through it%s%s", t.Name, selection.Endpoint,
@@ -236,18 +239,58 @@ func (d *Daemon) runWarp(ctx context.Context, t *config.Tunnel) {
 			status.MedianMs = -1
 			status.LossPct = 0
 		})
-		return nil
 	}
 
+	// connect applies the winner and keeps it if traffic flows within a few
+	// seconds. A pair the probe just passed often carries nothing once on
+	// the tunnel (the handshake works, the data does not: some flows get
+	// blocked on the way), so the alternates from the same round come next,
+	// and then the previous pair when it was working. It reports whether it
+	// fell back to previous. With nothing working it leaves the winner on
+	// the device and lets the health check decide.
+	connect := func(selection warp.Selection, reason string, previous *warp.Selection) (warp.Selection, bool, error) {
+		tries := append([]warp.Selection{selection}, selection.Alternates...)
+		for index, candidate := range tries {
+			if err := applyOne(candidate); err != nil {
+				return selection, false, err
+			}
+			if carries(ctx, mark) {
+				if index > 0 {
+					reason += fmt.Sprintf("; backup %d of the round", index)
+				}
+				announce(candidate, reason)
+				return candidate, false, nil
+			}
+			if ctx.Err() != nil {
+				return selection, false, ctx.Err()
+			}
+			cache.SitesFailed(candidate.Endpoint)
+			log.Printf("tunnel %s: no traffic through %s once applied; trying the next candidate", t.Name, candidate.Endpoint)
+		}
+		if previous != nil {
+			if err := applyOne(*previous); err == nil && carries(ctx, mark) {
+				log.Printf("tunnel %s: no candidate carried traffic; back on %s", t.Name, previous.Endpoint)
+				d.board.tunnel(t.Name, func(status *TunnelStatus) { status.State = "up"; status.Error = "" })
+				return *previous, true, nil
+			}
+		}
+		if err := applyOne(selection); err != nil {
+			return selection, false, err
+		}
+		announce(selection, reason+"; no traffic yet")
+		return selection, false, nil
+	}
 	switchRequests, unregister := d.switchChannel(t.Name)
 	defer unregister()
 
 	var lastQualityCheck time.Time
+	// reconnects counts flows revived from a new source port.
+	reconnects := 0
 	for ctx.Err() == nil {
 		d.board.tunnel(t.Name, func(status *TunnelStatus) { status.State = "selecting"; status.Error = "" })
 		selection, err := selectBest("")
 		if err == nil {
-			err = apply(selection, "")
+			selection, _, err = connect(selection, "", nil)
 		}
 		if err != nil {
 			if ctx.Err() != nil {
@@ -288,14 +331,18 @@ func (d *Daemon) runWarp(ctx context.Context, t *config.Tunnel) {
 					status.Quality = "тестовые сайты не открываются, подбор другого сервера…"
 				})
 				candidate, err := selectBest(selection.Endpoint)
+				rolledBack := false
 				if err == nil {
-					err = apply(candidate, "; test sites failed through "+selection.Endpoint)
+					candidate, rolledBack, err = connect(candidate, "; test sites failed through "+selection.Endpoint, &selection)
 				}
 				if err != nil {
 					if ctx.Err() != nil {
 						return
 					}
 					log.Printf("tunnel %s: %v", t.Name, err)
+					continue
+				}
+				if rolledBack {
 					continue
 				}
 				selection = candidate
@@ -309,8 +356,12 @@ func (d *Daemon) runWarp(ctx context.Context, t *config.Tunnel) {
 				log.Printf("tunnel %s: switching away from %s on request", t.Name, selection.Endpoint)
 				d.board.tunnel(t.Name, func(status *TunnelStatus) { status.Quality = "смена сервера по запросу…" })
 				candidate, err := selectBest(selection.Endpoint)
+				rolledBack := false
 				if err == nil {
-					err = apply(candidate, "; on request, was "+selection.Endpoint)
+					candidate, rolledBack, err = connect(candidate, "; on request, was "+selection.Endpoint, &selection)
+				}
+				if err == nil && rolledBack {
+					err = errors.New("ни один найденный сервер не пропустил трафик, оставлен прежний")
 				}
 				if err != nil {
 					if ctx.Err() != nil {
@@ -331,6 +382,24 @@ func (d *Daemon) runWarp(ctx context.Context, t *config.Tunnel) {
 				continue
 			}
 			if result == watchFailed {
+				// A dead flow is usually the DPI cutting this UDP flow (seen
+				// after a couple of minutes or a few MB), not a dead endpoint:
+				// the same pair from a new source port with a new handshake
+				// (Apply does both) works again at once.
+				log.Printf("tunnel %s: no traffic through %s; reconnecting from a new source port", t.Name, selection.Endpoint)
+				if applyOne(selection) == nil && carries(ctx, mark) {
+					reconnects++
+					d.board.tunnel(t.Name, func(status *TunnelStatus) {
+						status.State = "up"
+						status.Error = ""
+						status.Reconnects = reconnects
+					})
+					window.reset()
+					continue
+				}
+				if ctx.Err() != nil {
+					return
+				}
 				cache.Forget(selection.Endpoint)
 				log.Printf("tunnel %s: endpoint %s stopped passing traffic; selecting a new one", t.Name, selection.Endpoint)
 				break
@@ -359,11 +428,13 @@ func (d *Daemon) runWarp(ctx context.Context, t *config.Tunnel) {
 				d.board.tunnel(t.Name, func(status *TunnelStatus) { status.Quality = reason + "; " + note })
 				continue
 			}
-			if err := apply(candidate, "; replaced "+selection.Endpoint+": "+reason); err != nil {
-				log.Printf("tunnel %s: apply %s: %v", t.Name, candidate.Endpoint, err)
+			applied, rolledBack, err := connect(candidate, "; replaced "+selection.Endpoint+": "+reason, &selection)
+			if err != nil || rolledBack {
+				log.Printf("tunnel %s: switch to %s failed: %v", t.Name, candidate.Endpoint, err)
 				d.board.tunnel(t.Name, func(status *TunnelStatus) { status.Quality = reason + "; не удалось переключить" })
 				continue
 			}
+			candidate = applied
 			d.board.tunnel(t.Name, func(status *TunnelStatus) {
 				status.Quality = fmt.Sprintf("переключено с %s: %s", selection.Endpoint, reason)
 			})
@@ -388,11 +459,95 @@ const (
 // tunnel stays on a working endpoint instead of hopping forever.
 const maxSiteSwitches = 3
 
+// After an apply, carries gives the new session carryGrace for its
+// handshake, then up to carryAttempts pings of carryTimeout: a pair that
+// works answers within a second or two.
+const (
+	carryGrace    = time.Second
+	carryAttempts = 4
+	carryTimeout  = 1500 * time.Millisecond
+)
+
+// carries reports whether traffic flows through the tunnel with this mark
+// shortly after an apply.
+func carries(ctx context.Context, mark uint32) bool {
+	if !sleep(ctx, carryGrace) {
+		return false
+	}
+	for attempt := 0; attempt < carryAttempts; attempt++ {
+		if _, err := tunnel.Ping(ctx, mark, carryTimeout); err == nil {
+			return true
+		}
+		if ctx.Err() != nil {
+			return false
+		}
+	}
+	return false
+}
+
 func orDash(value string) string {
 	if value == "" {
 		return "-"
 	}
 	return value
+}
+
+// Between health checks the tunnel's interface counters are read every
+// stallTick: when it keeps sending for stallWindow and receives nothing, the
+// flow was most likely cut, and two quick pings confirm it at once instead
+// of at the next health check.
+const (
+	stallTick   = 2 * time.Second
+	stallWindow = 4 * time.Second
+	// stallMinSent ignores keepalives and stray packets.
+	stallMinSent = 600
+)
+
+// pauseWatching waits one health interval like pause, and returns
+// watchFailed early when the tunnel stalls.
+func (d *Daemon) pauseWatching(ctx context.Context, t *config.Tunnel, mark uint32, switchRequests <-chan struct{}) watchResult {
+	deadline := time.Now().Add(t.HealthInterval)
+	type sample struct {
+		at     time.Time
+		rx, tx uint64
+	}
+	var samples []sample
+	for time.Now().Before(deadline) {
+		if result := pause(ctx, stallTick, switchRequests); result >= 0 {
+			return result
+		}
+		rx, tx, ok := system.InterfaceBytes(t.Device)
+		if !ok {
+			continue
+		}
+		now := sample{time.Now(), rx, tx}
+		samples = append(samples, now)
+		for len(samples) > 1 && now.at.Sub(samples[0].at) > stallWindow {
+			samples = samples[1:]
+		}
+		first := samples[0]
+		if now.at.Sub(first.at) < stallWindow-stallTick/2 || now.rx != first.rx || now.tx-first.tx < stallMinSent {
+			continue
+		}
+		stalled := true
+		for attempt := 0; attempt < 2 && stalled; attempt++ {
+			if _, err := tunnel.Ping(ctx, mark, carryTimeout); err == nil {
+				stalled = false
+			}
+		}
+		if ctx.Err() != nil {
+			return watchStopped
+		}
+		if stalled {
+			d.board.tunnel(t.Name, func(status *TunnelStatus) {
+				status.PingMs = -1
+				status.Error = "нет ответа через туннель"
+			})
+			return watchFailed
+		}
+		samples = samples[:0]
+	}
+	return -1
 }
 
 // pause waits for delay like sleep and reports watchSwitch when a manual
@@ -491,7 +646,7 @@ func (d *Daemon) watch(ctx context.Context, t *config.Tunnel, mark uint32, fresh
 				return watchPoor
 			}
 		}
-		if result := pause(ctx, t.HealthInterval, switchRequests); result >= 0 {
+		if result := d.pauseWatching(ctx, t, mark, switchRequests); result >= 0 {
 			return result
 		}
 	}
