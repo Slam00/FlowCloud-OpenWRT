@@ -170,11 +170,20 @@ func (r Ruleset) Render() string {
 		fmt.Fprintf(&b, "\t\ttcp dport { 80, 443 } ct original packets 1-%d %s\n", zapretPackets, queue)
 		fmt.Fprintf(&b, "\t\tudp dport 443 ct original packets 1-%d %s\n", zapretPackets, queue)
 		b.WriteString("\t}\n")
-		// Replies (SYN,ACK TTL for autottl, server hello) before NAT.
-		b.WriteString("\tchain zapret_pre {\n\t\ttype filter hook prerouting priority -99; policy accept;\n")
+		// Replies (SYN,ACK TTL for autottl, server hello) before NAT undoes
+		// masquerading (dstnat is -100), so nfqws2 sees the same addresses
+		// in both directions, like zapret's PRENAT chain.
+		b.WriteString("\tchain zapret_pre {\n\t\ttype filter hook prerouting priority -101; policy accept;\n")
 		fmt.Fprintf(&b, "\t\tct mark and %s != %s return\n", mask, zapret)
 		fmt.Fprintf(&b, "\t\ttcp sport { 80, 443 } ct reply packets 1-%d %s\n", zapretPackets, queue)
 		fmt.Fprintf(&b, "\t\tudp sport 443 ct reply packets 1-%d %s\n", zapretPackets, queue)
+		b.WriteString("\t}\n")
+		// Packets nfqws2 sends carry the post-NAT source of a forwarded flow.
+		// Tracked, they would open a new conntrack entry and masquerading
+		// would move them to another source port, so the server never saw
+		// them: LAN clients failed while the router's own tests passed.
+		b.WriteString("\tchain zapret_notrack {\n\t\ttype filter hook output priority -401; policy accept;\n")
+		fmt.Fprintf(&b, "\t\tmeta mark and %s != 0 notrack\n", desync)
 		b.WriteString("\t}\n")
 	}
 

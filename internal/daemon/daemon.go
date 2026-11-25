@@ -51,12 +51,15 @@ type Daemon struct {
 	adder    *nft.Adder
 	resolved map[string]lists.Result
 	bypass   map[string][]netip.Prefix // extra bypass prefixes by tunnel
+	// recent outlives reloads, so zapret checks keep the hosts in use.
+	recent *dnsproxy.Recent
 }
 
 func New(opts Options) *Daemon {
 	return &Daemon{
-		opts:  opts,
-		board: &statusBoard{path: filepath.Join(opts.RunDir, "status.json")},
+		opts:   opts,
+		board:  &statusBoard{path: filepath.Join(opts.RunDir, "status.json")},
+		recent: &dnsproxy.Recent{},
 	}
 }
 
@@ -180,6 +183,7 @@ func (d *Daemon) runOnce(ctx context.Context, updateLists <-chan struct{}) error
 		StripAAAA:  cfg.Settings.StripAAAA,
 		MinTimeout: cfg.Settings.MinSetTimeout,
 		Adder:      d.adder,
+		Recent:     d.recent,
 	}
 	d.proxy.SetState(d.dnsState())
 	dnsErrors := make(chan error, 1)
@@ -386,7 +390,7 @@ func (d *Daemon) dnsState() *dnsproxy.State {
 	var routes []dnsproxy.Route
 	for _, section := range d.activeSections() {
 		domains = append(domains, d.resolved[section.Name].Domains)
-		routes = append(routes, dnsproxy.Route{Section: section.Name})
+		routes = append(routes, dnsproxy.Route{Section: section.Name, Watch: section.Action == config.ActionZapret})
 	}
 	return &dnsproxy.State{Matcher: dnsproxy.NewMatcher(domains), Routes: routes}
 }

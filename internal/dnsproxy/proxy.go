@@ -20,6 +20,8 @@ import (
 // Route is what the proxy needs to know about a section.
 type Route struct {
 	Section string
+	// Watch records the section's resolved hosts in Proxy.Recent.
+	Watch bool
 }
 
 // State is swapped atomically when lists or sections change.
@@ -45,6 +47,8 @@ type Proxy struct {
 		Add([]nft.Element) error
 	}
 	Stats Stats
+	// Recent collects the hosts of watched sections.
+	Recent *Recent
 
 	state atomic.Pointer[State]
 }
@@ -163,6 +167,9 @@ func (p *Proxy) Handle(ctx context.Context, query []byte) []byte {
 	addresses, ttl := ipv4Answers(response)
 	if len(addresses) == 0 {
 		return response
+	}
+	if state.Routes[section].Watch && p.Recent != nil {
+		p.Recent.note(question.Name.String(), addresses)
 	}
 	timeout := time.Duration(ttl) * time.Second
 	if timeout < p.MinTimeout {

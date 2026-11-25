@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"log"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -33,6 +34,12 @@ const (
 	// networkCheckURL tells "the network is down" from "the DPI blocks the
 	// test hosts": without it a dead uplink would start a strategy search.
 	networkCheckURL = "https://1.1.1.1/cdn-cgi/trace"
+	// A check also opens up to zapretRecentHosts hosts devices resolved in
+	// the last zapretRecentAge; a host no strategy opens is skipped for
+	// zapretIgnoreFor.
+	zapretRecentHosts = 3
+	zapretRecentAge   = 15 * time.Minute
+	zapretIgnoreFor   = time.Hour
 )
 
 // zapretWanted reports whether an active section uses zapret2.
@@ -123,8 +130,43 @@ func (d *Daemon) runZapret(ctx context.Context, z config.Zapret) {
 	}
 	log.Printf("zapret: nfqws2 started with strategy %s", current.Name)
 
+	// Besides the test URLs, a check opens a few hosts LAN devices resolved
+	// lately in zapret sections: a nearby Google cache node can sit behind
+	// a DPI that the main YouTube servers do not, and only a strategy that
+	// opens both keeps video working. Hosts no strategy opens (a dead or
+	// IP-blocked server) are left out for a while so they cannot keep a
+	// search going.
+	testHosts := map[string]bool{}
+	for _, raw := range z.TestURLs {
+		if parsed, err := url.Parse(raw); err == nil {
+			testHosts[strings.ToLower(parsed.Hostname())] = true
+		}
+	}
+	ignored := map[string]time.Time{}
+	var hosts []zapret.Host
+	pickHosts := func() {
+		hosts = nil
+		now := time.Now()
+		for _, host := range d.recent.Pick(zapretRecentHosts, zapretRecentAge, func(name string) bool {
+			return testHosts[name] || now.Before(ignored[name])
+		}) {
+			hosts = append(hosts, zapret.Host{Name: host.Name, Address: host.Addresses[0].String()})
+		}
+	}
+	// passed collects, during a search, the hosts some strategy opened.
+	var passed map[string]bool
 	probe := func() []zapret.URLResult {
 		results := zapret.Probe(ctx, z.TestURLs, netx.MarkZapret)
+		if len(hosts) > 0 {
+			results = append(results, zapret.ProbeHosts(ctx, hosts, netx.MarkZapret)...)
+		}
+		if passed != nil {
+			for _, result := range results {
+				if result.OK {
+					passed[result.URL] = true
+				}
+			}
+		}
 		d.zapretStatus(func(status *ZapretStatus) {
 			status.Results = results
 			status.CheckedAt = time.Now().Unix()
@@ -139,6 +181,7 @@ func (d *Daemon) runZapret(ctx context.Context, z config.Zapret) {
 		return
 	}
 	for ctx.Err() == nil {
+		pickHosts()
 		results := probe()
 		if !zapret.AllOK(results) && sleep(ctx, zapretRecheckDelay) {
 			results = probe()
@@ -161,13 +204,23 @@ func (d *Daemon) runZapret(ctx context.Context, z config.Zapret) {
 					status.Error = "тестовые адреса не открываются; включите автоподбор или смените стратегию"
 				})
 			default:
-				passed := 0
+				count := 0
+				passed = map[string]bool{}
 				for _, result := range results {
 					if result.OK {
-						passed++
+						count++
+						passed[result.URL] = true
 					}
 				}
-				if next, ok := d.searchZapret(ctx, current, passed, start, probe); ok {
+				next, ok := d.searchZapret(ctx, current, count, start, probe)
+				for _, host := range hosts {
+					if !passed["tls://"+host.Name] && ctx.Err() == nil {
+						ignored[host.Name] = time.Now().Add(zapretIgnoreFor)
+						log.Printf("zapret: no strategy opens %s; not testing it for %s", host.Name, zapretIgnoreFor)
+					}
+				}
+				passed = nil
+				if ok {
 					if next.Name != current.Name {
 						_ = os.WriteFile(statePath, []byte(next.Name+"\n"), 0o644)
 					}

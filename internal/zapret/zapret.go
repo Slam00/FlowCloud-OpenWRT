@@ -6,10 +6,12 @@ package zapret
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -208,11 +210,85 @@ func Probe(ctx context.Context, urls []string, mark uint32) []URLResult {
 	return results
 }
 
+// shortHello makes a small TLS 1.2 ClientHello of about 200 bytes, like
+// Windows schannel and older devices send. Go's default hello is large (TLS
+// 1.3 with a post-quantum key share, like current browsers), and some
+// strategies (plain disorder, seqovl) pass it but not a short one: a URL
+// passes only when both open.
+var shortHello = &tls.Config{
+	MaxVersion:       tls.VersionTLS12,
+	CurvePreferences: []tls.CurveID{tls.X25519, tls.CurveP256},
+}
+
+// Host is a host LAN devices use, tested by a TLS handshake with its name
+// against an address they were given.
+type Host struct {
+	Name    string
+	Address string
+}
+
+// ProbeHosts tests each host with both ClientHellos. A host passes when the
+// handshake completes with a valid certificate: the DPI acts on the SNI, so a
+// completed handshake means the flow got through.
+func ProbeHosts(ctx context.Context, hosts []Host, mark uint32) []URLResult {
+	results := make([]URLResult, len(hosts))
+	var wait sync.WaitGroup
+	for index, host := range hosts {
+		wait.Add(1)
+		go func(index int, host Host) {
+			defer wait.Done()
+			result := handshake(ctx, host, mark, &tls.Config{ServerName: host.Name})
+			if result.OK {
+				short := shortHello.Clone()
+				short.ServerName = host.Name
+				if second := handshake(ctx, host, mark, short); !second.OK {
+					second.Error = "TLS 1.2: " + second.Error
+					result = second
+				}
+			}
+			results[index] = result
+		}(index, host)
+	}
+	wait.Wait()
+	return results
+}
+
+func handshake(ctx context.Context, host Host, mark uint32, config *tls.Config) URLResult {
+	result := URLResult{URL: "tls://" + host.Name}
+	probeContext, cancel := context.WithTimeout(ctx, probeTimeout)
+	defer cancel()
+	started := time.Now()
+	dialer := &tls.Dialer{NetDialer: netx.MarkedDialer(mark, probeTimeout), Config: config}
+	connection, err := dialer.DialContext(probeContext, "tcp", net.JoinHostPort(host.Address, "443"))
+	result.Ms = time.Since(started).Milliseconds()
+	if err != nil {
+		result.Error = shortError(err)
+		return result
+	}
+	connection.Close()
+	result.OK = true
+	return result
+}
+
 func probeOne(ctx context.Context, url string, mark uint32) URLResult {
+	result := probeWith(ctx, url, mark, nil)
+	if !result.OK || !strings.HasPrefix(url, "https://") {
+		return result
+	}
+	short := probeWith(ctx, url, mark, shortHello)
+	if !short.OK {
+		short.Error = "TLS 1.2: " + short.Error
+		return short
+	}
+	return result
+}
+
+func probeWith(ctx context.Context, url string, mark uint32, tlsConfig *tls.Config) URLResult {
 	result := URLResult{URL: url}
 	dialer := netx.MarkedDialer(mark, probeTimeout)
 	transport := &http.Transport{
 		DialContext:         dialer.DialContext,
+		TLSClientConfig:     tlsConfig,
 		TLSHandshakeTimeout: probeTimeout,
 		DisableKeepAlives:   true,
 		// HTTP/1.1 keeps the request on one TCP flow the DPI can act on.
