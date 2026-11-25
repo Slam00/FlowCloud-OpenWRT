@@ -110,3 +110,24 @@ func TestBetterSelectionRanksSitesThenColoThenRTT(t *testing.T) {
 		t.Fatal("location codes compare case-insensitively")
 	}
 }
+
+func TestEndpointCacheKeepsColoAndSites(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "endpoints.json")
+	cache := newEndpointCache(path)
+	cache.rememberSelection(Selection{Endpoint: "8.39.125.105:1701", Profile: defaultAWGProfile(), Source: "pool",
+		RTT: 45 * time.Millisecond, Colo: "ARN", SitesOK: 2, SitesTotal: 2})
+	cache.noteColo("8.35.211.176:1701", "DME")
+
+	reloaded := newEndpointCache(path)
+	entries := reloaded.snapshot()
+	if len(entries) != 1 || entries[0].Colo != "ARN" || !entries[0].Sites {
+		t.Fatalf("entries = %+v, want the ARN pair with sites", entries)
+	}
+	if reloaded.poolColo("8.35.211.9:2408") != "DME" || reloaded.poolColo("8.39.125.1:500") != "ARN" {
+		t.Fatal("pool locations must survive a reload")
+	}
+	reloaded.SitesFailed("8.39.125.105:1701")
+	if reloaded.snapshot()[0].Sites {
+		t.Fatal("a failed site check through the tunnel must clear the flag")
+	}
+}

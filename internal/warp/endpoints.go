@@ -180,6 +180,11 @@ type cachedEndpoint struct {
 	LatencyMs int64      `json:"latency_ms"`
 	OKAt      int64      `json:"ok_at"`
 	Fails     int        `json:"fails"`
+	// Colo is where the endpoint exits; Sites is true when every test URL
+	// opened through it last time. Such entries are tried first, before
+	// the ping stage, which makes the usual reselection take seconds.
+	Colo  string `json:"colo,omitempty"`
+	Sites bool   `json:"sites,omitempty"`
 }
 
 const (
@@ -193,7 +198,14 @@ const (
 type endpointCacheFile struct {
 	Version int              `json:"version"`
 	Entries []cachedEndpoint `json:"entries"`
+	// Colos maps a pool /24 to the Cloudflare location it was last seen
+	// exiting from: a network reaches each /24 through one location, so
+	// the site stage can test likely good pools first.
+	Colos map[string]string `json:"colos,omitempty"`
 }
+
+// poolColosMax bounds the remembered /24 locations.
+const poolColosMax = 256
 
 // endpointCache persists working WARP endpoints across restarts so the next
 // selection probes known-good pairs first. A nil cache is valid and stores
@@ -202,7 +214,71 @@ type endpointCache struct {
 	path    string
 	mutex   sync.Mutex
 	entries []cachedEndpoint
+	colos   map[string]string
 	now     func() time.Time
+}
+
+func poolKey(endpoint string) string {
+	address, err := netip.ParseAddrPort(endpoint)
+	if err != nil || !address.Addr().Is4() {
+		return ""
+	}
+	prefix, _ := address.Addr().Prefix(24)
+	return prefix.String()
+}
+
+// poolColo returns the location last seen for the endpoint's /24.
+func (c *endpointCache) poolColo(endpoint string) string {
+	if c == nil {
+		return ""
+	}
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	return c.colos[poolKey(endpoint)]
+}
+
+// noteColo remembers where an endpoint's /24 exits.
+func (c *endpointCache) noteColo(endpoint, colo string) {
+	key := poolKey(endpoint)
+	if c == nil || key == "" || colo == "" {
+		return
+	}
+	c.mutex.Lock()
+	if c.colos == nil {
+		c.colos = map[string]string{}
+	}
+	previous, known := c.colos[key]
+	changed := previous != colo && (known || len(c.colos) < poolColosMax)
+	if changed {
+		c.colos[key] = colo
+	}
+	c.mutex.Unlock()
+	if changed {
+		c.save()
+	}
+}
+
+// rememberSelection stores a winner with its location and site result.
+func (c *endpointCache) rememberSelection(selection Selection) {
+	if c == nil {
+		return
+	}
+	c.remember(warpCandidate{endpoint: selection.Endpoint, profile: selection.Profile, source: candidateSource(selection.Source)}, selection.RTT)
+	c.update(selection.Endpoint, func(entry *cachedEndpoint) bool {
+		entry.Colo = selection.Colo
+		entry.Sites = selection.SitesTotal > 0 && selection.SitesOK == selection.SitesTotal
+		return true
+	})
+	c.noteColo(selection.Endpoint, selection.Colo)
+}
+
+// SitesFailed records that the test URLs did not open through an endpoint
+// once it carried the tunnel, so it is not tried first again.
+func (c *endpointCache) SitesFailed(endpoint string) {
+	c.update(endpoint, func(entry *cachedEndpoint) bool {
+		entry.Sites = false
+		return true
+	})
 }
 
 func newEndpointCache(path string) *endpointCache {
@@ -226,6 +302,14 @@ func (c *endpointCache) load() {
 	var file endpointCacheFile
 	if json.Unmarshal(data, &file) != nil || file.Version != endpointCacheVersion {
 		return
+	}
+	for key, colo := range file.Colos {
+		if _, err := netip.ParsePrefix(key); err == nil && len(colo) <= 8 && len(c.colos) < poolColosMax {
+			if c.colos == nil {
+				c.colos = map[string]string{}
+			}
+			c.colos[key] = colo
+		}
 	}
 	now := c.now()
 	for _, entry := range file.Entries {
@@ -340,7 +424,7 @@ func (c *endpointCache) save() {
 		return
 	}
 	c.mutex.Lock()
-	data, err := json.Marshal(endpointCacheFile{Version: endpointCacheVersion, Entries: c.entries})
+	data, err := json.Marshal(endpointCacheFile{Version: endpointCacheVersion, Entries: c.entries, Colos: c.colos})
 	c.mutex.Unlock()
 	if err != nil || os.MkdirAll(filepath.Dir(c.path), 0o700) != nil {
 		return

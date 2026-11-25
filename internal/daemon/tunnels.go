@@ -275,6 +275,7 @@ func (d *Daemon) runWarp(ctx context.Context, t *config.Tunnel) {
 				// The probe account opened the test sites through this endpoint,
 				// the tunnel's own account does not: its exit may differ.
 				siteSwitches++
+				cache.SitesFailed(selection.Endpoint)
 				if siteSwitches >= maxSiteSwitches {
 					log.Printf("tunnel %s: test sites fail through %d endpoints in a row; keeping %s", t.Name, siteSwitches, selection.Endpoint)
 					d.board.tunnel(t.Name, func(status *TunnelStatus) {

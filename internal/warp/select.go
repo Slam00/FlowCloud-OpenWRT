@@ -67,8 +67,11 @@ const (
 	// collectWindow is how long the ping stage waits for more after the
 	// first answer.
 	shortlistSize = 6
-	collectWindow = 2 * time.Second
-	siteTimeout   = 8 * time.Second
+	collectWindow = time.Second
+	siteTimeout   = 5 * time.Second
+	// fastPathTries cached pairs that opened every site are tried before
+	// the ping stage.
+	fastPathTries = 2
 	// A test URL passes when its body ends or this much arrives: blocks
 	// often freeze a connection after the first 16 KB.
 	siteEnoughBytes = 64 * 1024
@@ -183,58 +186,130 @@ func Select(ctx context.Context, peer *Peer, cache *EndpointCache, opts Options)
 		return Selection{}, errors.New("WARP account is missing")
 	}
 	started := time.Now()
-	shortlist, err := pingStage(ctx, peer, cache, opts)
-	if err != nil {
-		return Selection{}, err
+	if len(opts.TestURLs) == 0 && len(opts.AvoidColos) == 0 {
+		shortlist, err := pingStage(ctx, peer, cache, opts, nil)
+		if err != nil {
+			return Selection{}, err
+		}
+		sort.SliceStable(shortlist, func(i, j int) bool { return shortlist[i].rtt < shortlist[j].rtt })
+		best := Selection{Endpoint: shortlist[0].candidate.endpoint, Profile: shortlist[0].candidate.profile,
+			Source: string(shortlist[0].candidate.source), RTT: shortlist[0].rtt, Latency: time.Since(started)}
+		cache.rememberSelection(best)
+		return best, nil
 	}
-	sort.SliceStable(shortlist, func(i, j int) bool { return shortlist[i].rtt < shortlist[j].rtt })
 
+	addresses := resolveTestHosts(ctx, opts.TestURLs)
 	var best Selection
 	found := false
-	if len(opts.TestURLs) == 0 && len(opts.AvoidColos) == 0 {
-		best = Selection{Endpoint: shortlist[0].candidate.endpoint, Profile: shortlist[0].candidate.profile,
-			Source: string(shortlist[0].candidate.source), RTT: shortlist[0].rtt}
-		found = true
-	} else {
-		addresses := resolveTestHosts(ctx, opts.TestURLs)
-		for _, entry := range shortlist {
-			if ctx.Err() != nil {
-				return Selection{}, ctx.Err()
-			}
-			selection, err := evaluate(ctx, peer, entry.candidate, opts, addresses)
-			if err != nil {
-				continue
-			}
-			if !found || betterSelection(selection, best, opts.AvoidColos) {
-				best, found = selection, true
-			}
-			if selection.SitesOK == selection.SitesTotal && !avoided(selection.Colo, opts.AvoidColos) {
-				break
-			}
+	perfect := func(selection Selection) bool {
+		return selection.SitesOK == selection.SitesTotal && !avoided(selection.Colo, opts.AvoidColos)
+	}
+	consider := func(selection Selection) {
+		cache.noteColo(selection.Endpoint, selection.Colo)
+		if !found || betterSelection(selection, best, opts.AvoidColos) {
+			best, found = selection, true
+		}
+	}
+	finish := func() (Selection, error) {
+		best.Latency = time.Since(started)
+		cache.rememberSelection(best)
+		return best, nil
+	}
+
+	// Fast path: the pairs that opened every site last time, outside the
+	// avoided locations. Usually the first one still does.
+	tried := map[string]bool{}
+	fast := 0
+	for _, entry := range cache.snapshot() {
+		if fast == fastPathTries || ctx.Err() != nil {
+			break
+		}
+		if !entry.Sites || avoided(entry.Colo, opts.AvoidColos) || entry.Endpoint == opts.Exclude {
+			continue
+		}
+		fast++
+		tried[entry.Endpoint] = true
+		selection, _, err := evaluate(ctx, peer, warpCandidate{entry.Endpoint, entry.Profile, sourceCached}, opts, addresses, false)
+		if err != nil {
+			cache.fail(entry.Endpoint)
+			continue
+		}
+		consider(selection)
+		if perfect(selection) {
+			return finish()
+		}
+	}
+
+	shortlist, err := pingStage(ctx, peer, cache, opts, tried)
+	if err != nil {
+		if found {
+			return finish()
+		}
+		return Selection{}, err
+	}
+	// Pools seen exiting in an avoided location go last, then by round trip.
+	sort.SliceStable(shortlist, func(i, j int) bool {
+		avoidI := avoided(cache.poolColo(shortlist[i].candidate.endpoint), opts.AvoidColos)
+		avoidJ := avoided(cache.poolColo(shortlist[j].candidate.endpoint), opts.AvoidColos)
+		if avoidI != avoidJ {
+			return avoidJ
+		}
+		return shortlist[i].rtt < shortlist[j].rtt
+	})
+	// An endpoint in an avoided location skips the site test while other
+	// candidates remain: a blocked site costs a full timeout each time.
+	var deferred []warpCandidate
+	for _, entry := range shortlist {
+		if ctx.Err() != nil {
+			return Selection{}, ctx.Err()
+		}
+		selection, skipped, err := evaluate(ctx, peer, entry.candidate, opts, addresses, true)
+		if err != nil {
+			continue
+		}
+		cache.noteColo(selection.Endpoint, selection.Colo)
+		if skipped {
+			deferred = append(deferred, entry.candidate)
+			continue
+		}
+		consider(selection)
+		if perfect(selection) {
+			return finish()
+		}
+	}
+	// Nothing outside the avoided locations opened every site: test those.
+	for _, candidate := range deferred {
+		if ctx.Err() != nil {
+			return Selection{}, ctx.Err()
+		}
+		if found && best.SitesOK == best.SitesTotal {
+			break
+		}
+		selection, _, err := evaluate(ctx, peer, candidate, opts, addresses, false)
+		if err == nil {
+			consider(selection)
 		}
 	}
 	if !found {
 		return Selection{}, errors.New("no WARP endpoint passed the second check")
 	}
-	best.Latency = time.Since(started)
-	cache.remember(warpCandidate{endpoint: best.Endpoint, profile: best.Profile, source: candidateSource(best.Source)}, best.RTT)
-	return best, nil
+	return finish()
 }
 
 // pingStage returns up to shortlistSize candidates that passed the ping,
 // collecting for collectWindow after the first one. All its tunnels are
 // closed when it returns.
-func pingStage(ctx context.Context, peer *Peer, cache *EndpointCache, opts Options) ([]pinged, error) {
+func pingStage(ctx context.Context, peer *Peer, cache *EndpointCache, opts Options, skip map[string]bool) ([]pinged, error) {
 	parallel := opts.Parallel
 	if parallel < 1 {
 		parallel = 1
 	}
 	rng := mrand.New(mrand.NewSource(time.Now().UnixNano()))
 	candidates := buildWarpCandidates(peer.RegisteredHost, peer.RegisteredPort, cache.snapshot(), rng)
-	if opts.Exclude != "" {
+	if opts.Exclude != "" || len(skip) > 0 {
 		kept := candidates[:0]
 		for _, candidate := range candidates {
-			if candidate.endpoint != opts.Exclude {
+			if candidate.endpoint != opts.Exclude && !skip[candidate.endpoint] {
 				kept = append(kept, candidate)
 			}
 		}
@@ -317,20 +392,25 @@ func pingStage(ctx context.Context, peer *Peer, cache *EndpointCache, opts Optio
 }
 
 // evaluate opens one candidate again and runs the site stage through it.
-func evaluate(ctx context.Context, peer *Peer, candidate warpCandidate, opts Options, addresses map[string]string) (Selection, error) {
+// With deferAvoided, an endpoint exiting in an avoided location returns
+// after the location check with skipped set and no site results.
+func evaluate(ctx context.Context, peer *Peer, candidate warpCandidate, opts Options, addresses map[string]string, deferAvoided bool) (Selection, bool, error) {
 	tunnel, err := openProbe(peer, candidate, opts.Fwmark)
 	if err != nil {
-		return Selection{}, err
+		return Selection{}, false, err
 	}
 	defer tunnel.close()
 	rtt, err := tunnel.probe(ctx)
 	if err != nil {
-		return Selection{}, err
+		return Selection{}, false, err
 	}
 	selection := Selection{Endpoint: candidate.endpoint, Profile: candidate.profile, Source: string(candidate.source),
 		RTT: rtt, SitesTotal: len(opts.TestURLs)}
 	client := tunnel.httpClient(addresses)
 	selection.Colo = traceColo(ctx, client)
+	if deferAvoided && avoided(selection.Colo, opts.AvoidColos) {
+		return selection, true, nil
+	}
 	type outcome struct {
 		url string
 		err error
@@ -347,7 +427,7 @@ func evaluate(ctx context.Context, peer *Peer, candidate warpCandidate, opts Opt
 			selection.SiteErrors = append(selection.SiteErrors, result.url+": "+result.err.Error())
 		}
 	}
-	return selection, nil
+	return selection, false, nil
 }
 
 // betterSelection ranks by test URLs opened, then by an exit outside the
