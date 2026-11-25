@@ -4,7 +4,8 @@
 		"read": {
 			"file": {
 				"/usr/bin/flowcloudd": [ "exec" ],
-				"/etc/init.d/flowcloud": [ "exec" ]
+				"/etc/init.d/flowcloud": [ "exec" ],
+				"/sbin/logread": [ "exec" ]
 			},
 			"uci": [ "flowcloud", "network" ]
 		},

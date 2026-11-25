@@ -10,7 +10,9 @@ import (
 
 // TunnelStatus is what LuCI shows for one tunnel.
 type TunnelStatus struct {
-	Name     string `json:"name"`
+	Name string `json:"name"`
+	// Index selects the tunnel's fwmark (flowcloudd probe -tunnel N).
+	Index    int    `json:"index"`
 	Type     string `json:"type"`
 	Device   string `json:"device"`
 	State    string `json:"state"` // starting, registering, selecting, up, down, disabled, error

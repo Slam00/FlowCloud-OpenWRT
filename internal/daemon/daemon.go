@@ -38,6 +38,9 @@ type Options struct {
 type Signals struct {
 	Reload      <-chan struct{}
 	UpdateLists <-chan struct{}
+	// Switch asks WARP tunnels with a request file (RequestSwitch) to move
+	// to another endpoint now.
+	Switch <-chan struct{}
 }
 
 type Daemon struct {
@@ -53,6 +56,8 @@ type Daemon struct {
 	bypass   map[string][]netip.Prefix // extra bypass prefixes by tunnel
 	// recent outlives reloads, so zapret checks keep the hosts in use.
 	recent *dnsproxy.Recent
+	// switches holds a channel per running WARP tunnel for manual switches.
+	switches map[string]chan struct{}
 }
 
 func New(opts Options) *Daemon {
@@ -78,6 +83,16 @@ func (d *Daemon) Run(ctx context.Context, signals Signals) error {
 		status.Version = d.opts.Version
 		status.StartedAt = time.Now().Unix()
 	})
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-signals.Switch:
+				d.deliverSwitches()
+			}
+		}
+	}()
 	for {
 		runContext, cancel := context.WithCancel(ctx)
 		done := make(chan error, 1)
@@ -135,7 +150,7 @@ func (d *Daemon) runOnce(ctx context.Context, updateLists <-chan struct{}) error
 			if !tunnel.Enabled {
 				state = "disabled"
 			}
-			status.Tunnels = append(status.Tunnels, TunnelStatus{Name: tunnel.Name, Type: tunnel.Type, Device: tunnel.Device, State: state, PingMs: -1, MedianMs: -1})
+			status.Tunnels = append(status.Tunnels, TunnelStatus{Name: tunnel.Name, Index: tunnel.Index, Type: tunnel.Type, Device: tunnel.Device, State: state, PingMs: -1, MedianMs: -1})
 		}
 	})
 	if !cfg.Settings.Enabled {

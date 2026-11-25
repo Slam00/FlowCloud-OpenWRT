@@ -125,18 +125,70 @@ function formatTime(unix) {
 	return new Date(unix * 1000).toLocaleString();
 }
 
-function renderStatus(status) {
-	if (!status || !status.running) {
-		var reason = _('Служба не запущена. Включите FlowCloud в настройках и сохраните.');
-		if (status && status.error && status.error != 'FlowCloud is disabled in settings')
-			reason = status.error;
-		return E('div', { 'class': 'alert-message warning' }, reason);
-	}
+function notRunning(status) {
+	if (status && status.running)
+		return null;
+	var reason = _('Служба не запущена. Включите FlowCloud в настройках и сохраните.');
+	if (status && status.error && status.error != 'FlowCloud is disabled in settings')
+		reason = status.error;
+	return E('div', { 'class': 'alert-message warning' }, reason);
+}
 
+function openDiagnostics(ev) {
+	if (ev)
+		ev.preventDefault();
+	var tab = document.querySelector('.cbi-tabmenu li[data-tab="diagnostics"] a');
+	if (tab)
+		tab.click();
+}
+
+function chip(title, children) {
+	return E('a', {
+		'href': '#',
+		'click': openDiagnostics,
+		'title': _('Подробнее на вкладке «Диагностика»'),
+		'style': 'display:inline-flex;align-items:center;gap:6px;padding:4px 10px;margin:0 6px 6px 0;border:1px solid rgba(128,128,128,.35);border-radius:6px;text-decoration:none;color:inherit'
+	}, [ E('strong', {}, title) ].concat(children));
+}
+
+// renderSummary is the short block on top of every tab: one chip per tunnel
+// and one for zapret2; the details live on the Diagnostics tab.
+function renderSummary(status) {
+	var stopped = notRunning(status);
+	if (stopped)
+		return stopped;
 	var nodes = [];
 	(status.warnings || []).forEach(function(warning) {
 		nodes.push(E('div', { 'class': 'alert-message warning' }, warning));
 	});
+	var chips = (status.tunnels || []).map(function(t) {
+		return chip(t.name, [
+			badge(STATE_LABELS[t.state] || t.state, STATE_COLORS[t.state] || '#888'),
+			t.state == 'up' ? pingCell(t.ping_ms) : '',
+			t.error && t.state != 'up' ? E('span', { 'style': 'color:#c94141;font-size:90%' }, '!') : ''
+		]);
+	});
+	var z = status.zapret;
+	if (z && z.active) {
+		var state = ZAPRET_STATES[z.state] || [ z.state, '#888' ];
+		var results = z.results || [];
+		var passed = results.filter(function(r) { return r.ok; }).length;
+		chips.push(chip('zapret2', [
+			badge(state[0], state[1]),
+			results.length ? E('span', { 'style': 'color:' + (passed == results.length ? '#2e9a5b' : '#c94141') },
+				_('%d из %d').format(passed, results.length)) : ''
+		]));
+	}
+	nodes.push(E('div', {}, chips));
+	return E('div', {}, nodes);
+}
+
+function renderStatus(status, warpSwitch) {
+	var stopped = notRunning(status);
+	if (stopped)
+		return stopped;
+
+	var nodes = [];
 
 	var tunnelRows = (status.tunnels || []).map(function(t) {
 		return E('tr', { 'class': 'tr' }, [
@@ -150,7 +202,12 @@ function renderStatus(status) {
 			E('td', { 'class': 'td' }, [
 				t.quality ? E('div', { 'style': 'color:#c98a14' }, t.quality) : '',
 				t.error ? E('div', { 'style': 'color:#c94141' }, t.error) : ''
-			])
+			]),
+			E('td', { 'class': 'td' }, (t.type == 'warp' && t.state == 'up') ? E('button', {
+				'class': 'cbi-button cbi-button-action',
+				'title': _('Подобрать другой сервер WARP сейчас, даже если текущий работает'),
+				'click': ui.createHandlerFn(null, warpSwitch, t.name)
+			}, _('Сменить сервер')) : '')
 		]);
 	});
 	nodes.push(E('h3', {}, _('Туннели')));
@@ -163,6 +220,7 @@ function renderStatus(status) {
 			E('th', { 'class': 'th' }, _('Пинг')),
 			E('th', { 'class': 'th' }, _('За 2 мин')),
 			E('th', { 'class': 'th' }, _('Профиль')),
+			E('th', { 'class': 'th' }, ''),
 			E('th', { 'class': 'th' }, '')
 		])
 	].concat(tunnelRows)));
@@ -212,6 +270,86 @@ function renderStatus(status) {
 	return E('div', {}, nodes);
 }
 
+function sizeText(bytes) {
+	if (bytes >= 1024 * 1024)
+		return (bytes / 1024 / 1024).toFixed(1) + ' ' + _('МБ');
+	if (bytes >= 1024)
+		return Math.round(bytes / 1024) + ' ' + _('КБ');
+	return bytes + ' ' + _('Б');
+}
+
+// renderDiag shows `flowcloudd diag -json`: every route to one address.
+function renderDiag(report) {
+	if (!report)
+		return E('div', { 'style': 'color:#c94141' }, _('Проверка не выполнена'));
+	if (report.error)
+		return E('div', { 'style': 'color:#c94141' }, report.error);
+	var rows = (report.routes || []).map(function(r) {
+		var pings = (r.pings_ms || []).map(function(ms) { return ms < 0 ? '×' : String(ms); }).join(' / ');
+		var f = r.fetch || {};
+		return E('tr', { 'class': 'tr' }, [
+			E('td', { 'class': 'td' }, E('strong', {}, r.label)),
+			E('td', { 'class': 'td' }, [ pingCell(r.avg_ms), E('span', { 'style': 'color:#888;font-size:90%' }, ' (' + pings + ')') ]),
+			E('td', { 'class': 'td' }, E('span', { 'style': 'color:' + (r.loss_pct ? '#c94141' : '#888') }, r.loss_pct + '%')),
+			E('td', { 'class': 'td' }, f.ok
+				? E('span', { 'style': 'color:#2e9a5b' }, _('открывается: %d мс, %s').format(f.ms, sizeText(f.bytes)))
+				: E('span', { 'style': 'color:#c94141' }, f.error || _('не открывается')))
+		]);
+	});
+	return E('div', {}, [
+		E('p', {}, [ E('code', {}, report.url), report.address ? ' → ' + report.address : '' ]),
+		E('table', { 'class': 'table' }, [
+			E('tr', { 'class': 'tr table-titles' }, [
+				E('th', { 'class': 'th' }, _('Маршрут')),
+				E('th', { 'class': 'th' }, _('Пинг (TCP)')),
+				E('th', { 'class': 'th' }, _('Потери')),
+				E('th', { 'class': 'th' }, _('Загрузка страницы'))
+			])
+		].concat(rows))
+	]);
+}
+
+// TabbedSection shows each UCI section of a type on its own tab instead of
+// one long page. The Map turns any .cbi-section-node-tabbed into tabs.
+var TabbedSection = form.TypedSection.extend({
+	renderContents: function(cfgsections, nodes) {
+		var sectionEl = this.super('renderContents', [ cfgsections, nodes ]);
+		if (!cfgsections.length)
+			return sectionEl;
+		var group = E('div', { 'class': 'cbi-section-node-tabbed' });
+		cfgsections.forEach(function(sid) {
+			var node = sectionEl.querySelector('.cbi-section-node[data-section-id="' + sid + '"]');
+			if (!node)
+				return;
+			var heading = node.previousElementSibling;
+			var remove = heading && heading.previousElementSibling;
+			var title = sid;
+			if (uci.get('flowcloud', sid, 'enabled') == '0')
+				title += ' ' + _('(выкл.)');
+			var pane = E('div', { 'data-tab': 'item-' + sid, 'data-tab-title': title });
+			pane.appendChild(node);
+			if (remove && remove.classList.contains('cbi-section-remove'))
+				pane.appendChild(remove);
+			if (heading && heading.tagName == 'H3')
+				heading.remove();
+			group.appendChild(pane);
+		});
+		sectionEl.insertBefore(group, sectionEl.lastElementChild);
+		return sectionEl;
+	}
+});
+
+// ContentSection is a tab with content built by the view, not UCI options.
+var ContentSection = form.NamedSection.extend({
+	render: function() {
+		return Promise.resolve(E('div', {
+			'class': 'cbi-section',
+			'data-tab': this.sectiontype,
+			'data-tab-title': this.title
+		}, this.content));
+	}
+});
+
 return view.extend({
 	load: function() {
 		return Promise.all([
@@ -230,7 +368,7 @@ return view.extend({
 		m.tabbed = true;
 
 		/* Sections */
-		s = m.section(form.TypedSection, 'section', _('Секции'),
+		s = m.section(TabbedSection, 'section', _('Секции'),
 			_('Каждая секция — набор доменов и подсетей и то, что с ними делать.'));
 		s.addremove = true;
 		s.anonymous = false;
@@ -283,7 +421,7 @@ return view.extend({
 		o.validate = validateURL;
 
 		/* Tunnels */
-		s = m.section(form.TypedSection, 'tunnel', _('Туннели'),
+		s = m.section(TabbedSection, 'tunnel', _('Туннели'),
 			_('WARP-туннель регистрируется в Cloudflare сам, подбирает сервер и профиль маскировки AmneziaWG и меняет сервер, если тот перестал отвечать. Любой другой VPN-интерфейс роутера (AmneziaWG, WireGuard, OpenVPN) подключается как «Существующий интерфейс».'));
 		s.addremove = true;
 		s.anonymous = false;
@@ -420,7 +558,79 @@ return view.extend({
 		o.datatype = 'ipaddrport(1)';
 		o.placeholder = '127.0.0.53:53';
 
-		var statusNode = E('div', { 'id': 'flowcloud-status' }, renderStatus(initialStatus));
+		/* Diagnostics */
+		var warpSwitch = function(name) {
+			return fs.exec(DAEMON, [ 'warp-switch', name ]).then(function(result) {
+				if (result.code != 0)
+					throw new Error(result.stderr || result.stdout || _('ошибка'));
+				ui.addNotification(null, E('p', _('Туннель %s ищет другой сервер WARP. Новый сервер появится в таблице через 10–30 секунд.').format(name)), 'info');
+			}).catch(function(err) {
+				ui.addNotification(null, E('p', _('Не удалось сменить сервер: %s').format(err.message || err)), 'danger');
+			});
+		};
+		var detailsNode = E('div', { 'id': 'flowcloud-details' }, renderStatus(initialStatus, warpSwitch));
+
+		var diagInput = E('input', {
+			'type': 'text',
+			'class': 'cbi-input-text',
+			'style': 'width:28em;max-width:100%',
+			'list': 'flowcloud-diag-targets',
+			'value': 'https://www.youtube.com/',
+			'placeholder': 'https://example.com/'
+		});
+		var diagTargets = E('datalist', { 'id': 'flowcloud-diag-targets' }, [
+			'https://www.youtube.com/', 'https://i.ytimg.com/generate_204', 'https://chatgpt.com/',
+			'https://web.telegram.org/', 'https://discord.com/', 'https://www.instagram.com/',
+			'https://1.1.1.1/cdn-cgi/trace'
+		].map(function(url) { return E('option', { 'value': url }); }));
+		var diagResult = E('div', { 'style': 'margin-top:8px' });
+		var runDiag = function() {
+			var target = diagInput.value.trim();
+			if (!target)
+				return;
+			dom.content(diagResult, E('p', { 'class': 'spinning' }, _('Проверяю %s по всем маршрутам… до 15 секунд').format(target)));
+			return fs.exec_direct(DAEMON, [ 'diag', '-json', target ], 'json').then(function(report) {
+				dom.content(diagResult, renderDiag(report));
+			}).catch(function(err) {
+				dom.content(diagResult, E('div', { 'style': 'color:#c94141' }, err.message || String(err)));
+			});
+		};
+		diagInput.addEventListener('keydown', function(ev) {
+			if (ev.key == 'Enter') {
+				ev.preventDefault();
+				runDiag();
+			}
+		});
+
+		var logNode = E('pre', { 'style': 'max-height:24em;overflow:auto;font-size:85%;white-space:pre-wrap;display:none' });
+		var showLog = function() {
+			return fs.exec_direct('/sbin/logread', [ '-e', 'flowcloud' ]).then(function(text) {
+				var lines = (text || '').trim().split('\n');
+				logNode.textContent = lines.slice(-150).reverse().join('\n') || _('Журнал пуст');
+				logNode.style.display = '';
+			}).catch(function(err) {
+				logNode.textContent = err.message || String(err);
+				logNode.style.display = '';
+			});
+		};
+
+		s = m.section(ContentSection, 'settings', 'diagnostics', _('Диагностика'));
+		s.content = [
+			detailsNode,
+			E('h3', {}, _('Проверка адреса')),
+			E('div', { 'class': 'cbi-section-descr' }, _('Пинг (время TCP-соединения, работает и там, где ICMP закрыт) и загрузка страницы напрямую, через каждый работающий туннель и через zapret2 — сразу видно, какой маршрут открывает сайт и какой быстрее.')),
+			E('div', {}, [
+				diagInput, diagTargets, ' ',
+				E('button', { 'class': 'cbi-button cbi-button-action', 'click': ui.createHandlerFn(this, runDiag) }, _('Проверить'))
+			]),
+			diagResult,
+			E('h3', {}, _('Журнал')),
+			E('div', {}, E('button', { 'class': 'cbi-button cbi-button-neutral', 'click': ui.createHandlerFn(this, showLog) }, _('Показать журнал'))),
+			E('div', { 'class': 'cbi-section-descr' }, _('Последние 150 записей FlowCloud, новые сверху.')),
+			logNode
+		];
+
+		var statusNode = E('div', { 'id': 'flowcloud-status' }, renderSummary(initialStatus));
 		var buttons = E('div', { 'class': 'cbi-page-actions', 'style': 'text-align:left;padding-top:0' }, [
 			E('button', {
 				'class': 'cbi-button cbi-button-action',
@@ -443,7 +653,10 @@ return view.extend({
 			return fs.exec_direct(DAEMON, [ 'status', '-json' ], 'json').then(function(status) {
 				var target = document.getElementById('flowcloud-status');
 				if (target)
-					dom.content(target, renderStatus(status));
+					dom.content(target, renderSummary(status));
+				target = document.getElementById('flowcloud-details');
+				if (target)
+					dom.content(target, renderStatus(status, warpSwitch));
 			}).catch(function() {});
 		}, 5);
 

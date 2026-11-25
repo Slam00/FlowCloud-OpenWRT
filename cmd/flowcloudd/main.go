@@ -35,6 +35,11 @@ const usage = `usage: flowcloudd <command>
   probe [-zapret|-direct|-tunnel N] URL...
                  fetch URLs the way the service tests them, through zapret2,
                  directly or through tunnel number N
+  diag [-json] URL|HOST
+                 ping and fetch a target directly, through every tunnel
+                 that is up and through zapret2
+  warp-switch NAME
+                 make WARP tunnel NAME move to another endpoint now
   version        print the version
 `
 
@@ -86,6 +91,22 @@ func main() {
 		if !ok {
 			os.Exit(1)
 		}
+	case "diag":
+		if flags.NArg() != 1 {
+			fmt.Fprint(os.Stderr, usage)
+			os.Exit(2)
+		}
+		diag(*runDir, flags.Arg(0), *asJSON)
+	case "warp-switch":
+		if flags.NArg() != 1 {
+			fmt.Fprint(os.Stderr, usage)
+			os.Exit(2)
+		}
+		if err := daemon.RequestSwitch(*runDir, flags.Arg(0)); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		signalDaemon(*runDir, syscall.SIGUSR2)
 	case "version":
 		fmt.Println(version)
 	default:
@@ -99,13 +120,17 @@ func run(configName, stateDir, runDir string) {
 	defer stop()
 	reload := make(chan struct{}, 1)
 	update := make(chan struct{}, 1)
+	switches := make(chan struct{}, 1)
 	signals := make(chan os.Signal, 4)
-	signal.Notify(signals, syscall.SIGHUP, syscall.SIGUSR1)
+	signal.Notify(signals, syscall.SIGHUP, syscall.SIGUSR1, syscall.SIGUSR2)
 	go func() {
 		for received := range signals {
 			target := reload
-			if received == syscall.SIGUSR1 {
+			switch received {
+			case syscall.SIGUSR1:
 				target = update
+			case syscall.SIGUSR2:
+				target = switches
 			}
 			select {
 			case target <- struct{}{}:
@@ -115,7 +140,7 @@ func run(configName, stateDir, runDir string) {
 	}()
 	log.Printf("flowcloudd %s starting", version)
 	d := daemon.New(daemon.Options{ConfigName: configName, StateDir: stateDir, RunDir: runDir, Version: version})
-	if err := d.Run(ctx, daemon.Signals{Reload: reload, UpdateLists: update}); err != nil {
+	if err := d.Run(ctx, daemon.Signals{Reload: reload, UpdateLists: update, Switch: switches}); err != nil {
 		log.Fatal(err)
 	}
 	log.Printf("flowcloudd stopped")

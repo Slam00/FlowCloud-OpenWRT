@@ -226,6 +226,9 @@ func (d *Daemon) runWarp(ctx context.Context, t *config.Tunnel) {
 		return nil
 	}
 
+	switchRequests, unregister := d.switchChannel(t.Name)
+	defer unregister()
+
 	var lastQualityCheck time.Time
 	for ctx.Err() == nil {
 		d.board.tunnel(t.Name, func(status *TunnelStatus) { status.State = "selecting"; status.Error = "" })
@@ -248,10 +251,36 @@ func (d *Daemon) runWarp(ctx context.Context, t *config.Tunnel) {
 		fresh := true
 		var window qualityWindow
 		for {
-			result := d.watch(ctx, t, mark, fresh, &window, limits)
+			result := d.watch(ctx, t, mark, fresh, &window, limits, switchRequests)
 			fresh = false
 			if result == watchStopped {
 				return
+			}
+			if result == watchSwitch {
+				// Asked from LuCI: any other working pair, faster or not.
+				log.Printf("tunnel %s: switching away from %s on request", t.Name, selection.Endpoint)
+				d.board.tunnel(t.Name, func(status *TunnelStatus) { status.Quality = "смена сервера по запросу…" })
+				candidate, err := selectBest(selection.Endpoint)
+				if err == nil {
+					err = apply(candidate, "; on request, was "+selection.Endpoint)
+				}
+				if err != nil {
+					if ctx.Err() != nil {
+						return
+					}
+					log.Printf("tunnel %s: switch on request: %v", t.Name, err)
+					d.board.tunnel(t.Name, func(status *TunnelStatus) {
+						status.Quality = "смена по запросу не удалась: " + err.Error()
+					})
+					continue
+				}
+				d.board.tunnel(t.Name, func(status *TunnelStatus) {
+					status.Quality = "сервер сменён по запросу, был " + selection.Endpoint
+				})
+				selection = candidate
+				window.reset()
+				fresh = true
+				continue
 			}
 			if result == watchFailed {
 				cache.Forget(selection.Endpoint)
@@ -299,13 +328,30 @@ const (
 	watchStopped watchResult = iota
 	watchFailed
 	watchPoor
+	watchSwitch
 )
+
+// pause waits for delay like sleep and reports watchSwitch when a manual
+// switch is requested meanwhile, watchStopped when ctx ends, else -1.
+func pause(ctx context.Context, delay time.Duration, switchRequests <-chan struct{}) watchResult {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return watchStopped
+	case <-switchRequests:
+		return watchSwitch
+	case <-timer.C:
+		return -1
+	}
+}
 
 // watch pings through the tunnel every health interval. It returns
 // watchFailed after consecutive failed pings (a fresh WARP endpoint gets a few
 // attempts for its first handshake), watchPoor when a full quality window
-// breaks a limit, or watchStopped when ctx ends.
-func (d *Daemon) watch(ctx context.Context, t *config.Tunnel, mark uint32, fresh bool, window *qualityWindow, limits qualityLimits) watchResult {
+// breaks a limit, watchSwitch on a manual switch request, or watchStopped
+// when ctx ends.
+func (d *Daemon) watch(ctx context.Context, t *config.Tunnel, mark uint32, fresh bool, window *qualityWindow, limits qualityLimits, switchRequests <-chan struct{}) watchResult {
 	failures := 0
 	attempts := failedPings
 	if fresh {
@@ -362,8 +408,8 @@ func (d *Daemon) watch(ctx context.Context, t *config.Tunnel, mark uint32, fresh
 				return watchPoor
 			}
 		}
-		if !sleep(ctx, t.HealthInterval) {
-			return watchStopped
+		if result := pause(ctx, t.HealthInterval, switchRequests); result >= 0 {
+			return result
 		}
 	}
 }
