@@ -10,14 +10,19 @@ import (
 
 // TunnelStatus is what LuCI shows for one tunnel.
 type TunnelStatus struct {
-	Name      string `json:"name"`
-	Type      string `json:"type"`
-	Device    string `json:"device"`
-	State     string `json:"state"` // starting, registering, selecting, up, down, disabled, error
-	Endpoint  string `json:"endpoint,omitempty"`
-	Profile   string `json:"profile,omitempty"`
-	Source    string `json:"source,omitempty"`
-	PingMs    int64  `json:"ping_ms"`
+	Name     string `json:"name"`
+	Type     string `json:"type"`
+	Device   string `json:"device"`
+	State    string `json:"state"` // starting, registering, selecting, up, down, disabled, error
+	Endpoint string `json:"endpoint,omitempty"`
+	Profile  string `json:"profile,omitempty"`
+	Source   string `json:"source,omitempty"`
+	PingMs   int64  `json:"ping_ms"`
+	// MedianMs and LossPct cover the last quality window (two minutes at
+	// the default interval).
+	MedianMs  int64  `json:"median_ms"`
+	LossPct   int    `json:"loss_pct"`
+	Quality   string `json:"quality,omitempty"`
 	CheckedAt int64  `json:"checked_at,omitempty"`
 	Switches  int    `json:"switches"`
 	Error     string `json:"error,omitempty"`

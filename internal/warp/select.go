@@ -32,7 +32,10 @@ type Selection struct {
 	Endpoint string
 	Profile  Profile
 	Source   string
-	Latency  time.Duration
+	// Latency is how long the round took; RTT is one TCP handshake through
+	// the winner once its WireGuard session is up, comparable with tunnel pings.
+	Latency time.Duration
+	RTT     time.Duration
 }
 
 const (
@@ -99,24 +102,37 @@ func openProbe(peer *Peer, candidate warpCandidate, fwmark uint32) (*probeTunnel
 	return &probeTunnel{device: dev, net: tunnelNet}, nil
 }
 
-func (t *probeTunnel) probe(ctx context.Context) error {
+// probe proves data flows through the candidate, then measures one more TCP
+// handshake: the first includes the WireGuard handshake, the second is the
+// plain round trip through the tunnel.
+func (t *probeTunnel) probe(ctx context.Context) (time.Duration, error) {
 	probeContext, cancel := context.WithTimeout(ctx, probeTimeout)
 	defer cancel()
 	address, err := net.ResolveTCPAddr("tcp", ProbeTarget)
 	if err != nil {
-		return err
+		return 0, err
 	}
+	started := time.Now()
 	connection, err := t.net.DialContextTCP(probeContext, address)
-	if connection != nil {
-		_ = connection.Close()
+	if err != nil {
+		return 0, err
 	}
-	return err
+	first := time.Since(started)
+	_ = connection.Close()
+	started = time.Now()
+	connection, err = t.net.DialContextTCP(probeContext, address)
+	if err != nil {
+		return first, nil
+	}
+	_ = connection.Close()
+	return time.Since(started), nil
 }
 
 // Select runs one selection round: up to `parallel` candidates are tested at a
 // time, each in its own userspace tunnel, and the first that passes wins.
 // Probe sockets carry fwmark so they never loop back into a tunnel.
-func Select(ctx context.Context, peer *Peer, cache *EndpointCache, parallel int, fwmark uint32) (Selection, error) {
+// exclude skips one endpoint, the current one when looking for a better pair.
+func Select(ctx context.Context, peer *Peer, cache *EndpointCache, parallel int, fwmark uint32, exclude string) (Selection, error) {
 	if peer == nil {
 		return Selection{}, errors.New("WARP account is missing")
 	}
@@ -125,12 +141,21 @@ func Select(ctx context.Context, peer *Peer, cache *EndpointCache, parallel int,
 	}
 	rng := mrand.New(mrand.NewSource(time.Now().UnixNano()))
 	candidates := buildWarpCandidates(peer.RegisteredHost, peer.RegisteredPort, cache.snapshot(), rng)
+	if exclude != "" {
+		kept := candidates[:0]
+		for _, candidate := range candidates {
+			if candidate.endpoint != exclude {
+				kept = append(kept, candidate)
+			}
+		}
+		candidates = kept
+	}
 	if len(candidates) == 0 {
 		return Selection{}, errors.New("no WARP endpoint candidates")
 	}
 	type result struct {
 		candidate warpCandidate
-		latency   time.Duration
+		rtt       time.Duration
 		err       error
 	}
 	roundContext, cancel := context.WithCancel(ctx)
@@ -148,13 +173,13 @@ func Select(ctx context.Context, peer *Peer, cache *EndpointCache, parallel int,
 			}
 			go func(candidate warpCandidate) {
 				defer func() { <-slots }()
-				attemptStarted := time.Now()
+				var rtt time.Duration
 				tunnel, err := openProbe(peer, candidate, fwmark)
 				if err == nil {
-					err = tunnel.probe(roundContext)
+					rtt, err = tunnel.probe(roundContext)
 				}
 				tunnel.close()
-				results <- result{candidate: candidate, latency: time.Since(attemptStarted), err: err}
+				results <- result{candidate: candidate, rtt: rtt, err: err}
 			}(candidate)
 		}
 	}()
@@ -165,12 +190,13 @@ func Select(ctx context.Context, peer *Peer, cache *EndpointCache, parallel int,
 		case outcome := <-results:
 			if outcome.err == nil {
 				cancel()
-				cache.remember(outcome.candidate, outcome.latency)
+				cache.remember(outcome.candidate, outcome.rtt)
 				return Selection{
 					Endpoint: outcome.candidate.endpoint,
 					Profile:  outcome.candidate.profile,
 					Source:   string(outcome.candidate.source),
 					Latency:  time.Since(started),
+					RTT:      outcome.rtt,
 				}, nil
 			}
 			if roundContext.Err() == nil {
@@ -194,7 +220,7 @@ func (c *endpointCache) Forget(endpoint string) { c.drop(endpoint) }
 
 // Remember stores a pair that is known to work.
 func (c *endpointCache) Remember(selection Selection) {
-	c.remember(warpCandidate{endpoint: selection.Endpoint, profile: selection.Profile, source: candidateSource(selection.Source)}, selection.Latency)
+	c.remember(warpCandidate{endpoint: selection.Endpoint, profile: selection.Profile, source: candidateSource(selection.Source)}, selection.RTT)
 }
 
 // Snapshot returns the cached pairs, best first.

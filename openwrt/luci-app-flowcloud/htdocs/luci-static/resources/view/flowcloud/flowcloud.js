@@ -17,6 +17,7 @@ var STATE_LABELS = {
 	up: _('Работает'),
 	down: _('Недоступен'),
 	disabled: _('Выключен'),
+	idle: _('Не используется'),
 	error: _('Ошибка')
 };
 
@@ -27,7 +28,8 @@ var STATE_COLORS = {
 	starting: '#c98a14',
 	down: '#c94141',
 	error: '#c94141',
-	disabled: '#888'
+	disabled: '#888',
+	idle: '#888'
 };
 
 var DOMAIN_RE = /^(\*\.|\.)?([a-z0-9_]([a-z0-9_-]{0,61}[a-z0-9_])?\.)*[a-z0-9_]([a-z0-9_-]{0,61}[a-z0-9_])?\.?$/i;
@@ -73,6 +75,17 @@ function pingCell(ms) {
 	return E('span', { 'style': 'color:' + color + ';font-weight:bold' }, ms + ' ' + _('мс'));
 }
 
+// Median ping and loss over the quality window (two minutes by default).
+function qualityCell(t) {
+	if (t.median_ms == null || t.median_ms < 0)
+		return E('span', { 'style': 'color:#888' }, '—');
+	var lossColor = t.loss_pct >= 30 ? '#c94141' : (t.loss_pct > 0 ? '#c98a14' : '#888');
+	return E('span', {}, [
+		_('медиана %d мс').format(t.median_ms), ', ',
+		E('span', { 'style': 'color:' + lossColor }, _('потери %d%%').format(t.loss_pct || 0))
+	]);
+}
+
 function formatTime(unix) {
 	if (!unix)
 		return '—';
@@ -99,8 +112,12 @@ function renderStatus(status) {
 			E('td', { 'class': 'td' }, badge(STATE_LABELS[t.state] || t.state, STATE_COLORS[t.state] || '#888')),
 			E('td', { 'class': 'td' }, E('code', {}, t.endpoint || '—')),
 			E('td', { 'class': 'td' }, pingCell(t.ping_ms)),
+			E('td', { 'class': 'td' }, qualityCell(t)),
 			E('td', { 'class': 'td' }, t.profile || ''),
-			E('td', { 'class': 'td', 'style': 'color:#c94141' }, t.error || '')
+			E('td', { 'class': 'td' }, [
+				t.quality ? E('div', { 'style': 'color:#c98a14' }, t.quality) : '',
+				t.error ? E('div', { 'style': 'color:#c94141' }, t.error) : ''
+			])
 		]);
 	});
 	nodes.push(E('h3', {}, _('Туннели')));
@@ -111,6 +128,7 @@ function renderStatus(status) {
 			E('th', { 'class': 'th' }, _('Состояние')),
 			E('th', { 'class': 'th' }, _('Сервер / устройство')),
 			E('th', { 'class': 'th' }, _('Пинг')),
+			E('th', { 'class': 'th' }, _('За 2 мин')),
 			E('th', { 'class': 'th' }, _('Профиль')),
 			E('th', { 'class': 'th' }, '')
 		])
@@ -257,13 +275,25 @@ return view.extend({
 		o = s.option(form.Value, 'probe_parallel', _('Проверять одновременно'),
 			_('Сколько серверов проверяется параллельно при подборе. На роутерах с 128 МБ памяти лучше 4–8.'));
 		o.datatype = 'range(1,24)';
-		o.placeholder = '8';
+		o.placeholder = _('авто');
 		o.depends('type', 'warp');
 
 		o = s.option(form.Value, 'health_interval', _('Проверка каждые, с'),
-			_('Как часто проверять, что туннель пропускает трафик.'));
+			_('Как часто проверять, что туннель пропускает трафик. Две неудачные проверки подряд — разрыв: сервер WARP меняется сразу. Качество оценивается по последним 8 проверкам (2 минуты при 15 с).'));
 		o.datatype = 'range(5,3600)';
 		o.placeholder = '15';
+
+		o = s.option(form.Value, 'max_ping', _('Макс. пинг, мс'),
+			_('Если медианный пинг за окно выше, FlowCloud ищет сервер WARP лучше и переключается, только если найденный быстрее хотя бы на 30%. Не чаще раза в 10 минут. 0 — не проверять.'));
+		o.datatype = 'range(0,10000)';
+		o.placeholder = '300';
+		o.depends('type', 'warp');
+
+		o = s.option(form.Value, 'max_loss', _('Макс. потери, %'),
+			_('Если за окно не прошло столько проверок или больше, сервер WARP меняется на любой рабочий. 0 — не проверять.'));
+		o.datatype = 'range(0,100)';
+		o.placeholder = '30';
+		o.depends('type', 'warp');
 
 		o = s.option(form.Flag, 'fail_closed', _('Не пускать мимо туннеля'),
 			_('Если туннель недоступен, трафик его секций блокируется, а не идёт напрямую.'));

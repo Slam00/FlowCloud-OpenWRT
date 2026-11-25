@@ -14,7 +14,6 @@ config settings 'settings'
 config tunnel 'warp'
 	option type 'warp'
 	option device 'fcwarp'
-	option probe_parallel '8'
 	option health_interval '15'
 	option fail_closed '0'
 

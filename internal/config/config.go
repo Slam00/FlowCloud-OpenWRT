@@ -49,6 +49,11 @@ type Tunnel struct {
 	ProbeParallel  int
 	FailClosed     bool
 	HealthInterval time.Duration
+	// MaxPingMs and MaxLossPct make a WARP tunnel look for a better endpoint
+	// when the median ping or the loss over the quality window exceed them;
+	// 0 disables a check.
+	MaxPingMs  int
+	MaxLossPct int
 	// Index is 1-based and stable for a given config: it selects the fwmark
 	// and the routing table.
 	Index int
@@ -183,9 +188,11 @@ func readTunnel(section *uci.Section) (*Tunnel, error) {
 		Type:           section.Get("type", TunnelWarp),
 		Enabled:        section.Bool("enabled", true),
 		Device:         section.Get("interface", ""),
-		ProbeParallel:  8,
+		ProbeParallel:  0, // 0: chosen by the daemon from the router's RAM
 		FailClosed:     section.Bool("fail_closed", false),
 		HealthInterval: 15 * time.Second,
+		MaxPingMs:      300,
+		MaxLossPct:     30,
 	}
 	if !sectionName.MatchString(tunnel.Name) {
 		return nil, fmt.Errorf("tunnel name %q: use letters, digits and _", tunnel.Name)
@@ -217,6 +224,20 @@ func readTunnel(section *uci.Section) (*Tunnel, error) {
 			return nil, fmt.Errorf("tunnel %s: probe_parallel must be 1-24", tunnel.Name)
 		}
 		tunnel.ProbeParallel = parallel
+	}
+	if value := section.Get("max_ping", ""); value != "" {
+		maxPing, err := strconv.Atoi(value)
+		if err != nil || maxPing < 0 || maxPing > 10000 {
+			return nil, fmt.Errorf("tunnel %s: max_ping must be 0-10000 ms", tunnel.Name)
+		}
+		tunnel.MaxPingMs = maxPing
+	}
+	if value := section.Get("max_loss", ""); value != "" {
+		maxLoss, err := strconv.Atoi(value)
+		if err != nil || maxLoss < 0 || maxLoss > 100 {
+			return nil, fmt.Errorf("tunnel %s: max_loss must be 0-100 %%", tunnel.Name)
+		}
+		tunnel.MaxLossPct = maxLoss
 	}
 	if value := section.Get("health_interval", ""); value != "" {
 		seconds, err := strconv.Atoi(value)

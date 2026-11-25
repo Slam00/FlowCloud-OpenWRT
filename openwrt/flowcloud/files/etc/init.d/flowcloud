@@ -9,11 +9,23 @@ PROG=/usr/bin/flowcloudd
 start_service() {
 	procd_open_instance
 	procd_set_param command "$PROG" run
+	# Soft heap limit: the Go runtime collects harder instead of growing past
+	# it, which keeps endpoint probing within a small router's RAM.
+	procd_set_param env GOMEMLIMIT=40MiB
 	procd_set_param respawn 3600 5 5
 	procd_set_param stdout 1
 	procd_set_param stderr 1
 	procd_set_param term_timeout 15
 	procd_close_instance
+}
+
+restart() {
+	# Tell the stopping daemon a new one follows: it keeps dnsmasq pointed at
+	# FlowCloud instead of restoring it and restarting dnsmasq twice.
+	mkdir -p /var/run/flowcloud
+	touch /var/run/flowcloud/restarting
+	stop
+	start
 }
 
 reload_service() {

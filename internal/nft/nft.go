@@ -131,6 +131,24 @@ func (r Ruleset) Render() string {
 	fmt.Fprintf(&b, "\t\tmeta mark and %s != 0 return\n", mask)
 	b.WriteString("\t\tmeta nfproto ipv4 jump classify\n\t}\n")
 
+	for _, mark := range sortedMarks {
+		if mark != netx.MarkDirect {
+			fmt.Fprintf(&b, "\tchain %s {}\n", replyMSSChain(mark))
+		}
+	}
+	// The outgoing path already has the tunnel route and its MTU. The reply
+	// is routed to the LAN, so use the original connection's tunnel instead.
+	b.WriteString("\tchain forward {\n\t\ttype filter hook forward priority mangle; policy accept;\n")
+	fmt.Fprintf(&b, "\t\tmeta mark and %s != 0 meta mark and %s != 0x%08x tcp flags syn / syn,rst tcp option maxseg size set rt mtu\n",
+		mask, mask, netx.MarkDirect)
+	for _, mark := range sortedMarks {
+		if mark != netx.MarkDirect {
+			fmt.Fprintf(&b, "\t\tmeta nfproto ipv4 ct direction reply ct mark and %s == 0x%08x tcp flags syn,ack / syn,ack,rst jump %s\n",
+				mask, mark, replyMSSChain(mark))
+		}
+	}
+	b.WriteString("\t}\n")
+
 	if r.RouteRouter {
 		b.WriteString("\tchain output {\n\t\ttype route hook output priority mangle; policy accept;\n")
 		// Sockets that already carry a mark (WireGuard with fwmark, the
@@ -141,6 +159,19 @@ func (r Ruleset) Render() string {
 	}
 	b.WriteString("}\n")
 	return b.String()
+}
+
+func replyMSSChain(mark uint32) string { return fmt.Sprintf("mss_reply_%08x", mark) }
+
+// SetReplyMSS sizes client-to-server TCP segments using the tunnel's MTU.
+func SetReplyMSS(mark uint32, mtu int) error {
+	const ipv4TCPHeaders = 40
+	chain := replyMSSChain(mark)
+	script := fmt.Sprintf("flush chain inet %s %s\n", Table, chain)
+	if mss := mtu - ipv4TCPHeaders; mss > 0 && mss < 65535 {
+		script += fmt.Sprintf("add rule inet %s %s tcp option maxseg size > %d tcp option maxseg size set %d\n", Table, chain, mss, mss)
+	}
+	return Apply(script)
 }
 
 // Apply loads the ruleset atomically.

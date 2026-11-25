@@ -58,8 +58,11 @@ func (k *Kernel) Ensure(peer *warp.Peer) error {
 }
 
 // Apply switches the device to the selected endpoint and profile without
-// taking it down.
+// taking it down. The peer is removed first: a kept peer would go on sending
+// with its old session, which the new endpoint does not know, and WireGuard
+// would only start a fresh handshake after about 15 silent seconds.
 func (k *Kernel) Apply(peer *warp.Peer, selection warp.Selection, publicKey string) error {
+	_, _ = system.Run("awg", "set", k.Device, "peer", publicKey, "remove")
 	args := []string{"set", k.Device}
 	args = append(args, selection.Profile.AWGArgs()...)
 	args = append(args, "peer", publicKey, "endpoint", selection.Endpoint,

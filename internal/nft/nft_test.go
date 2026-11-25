@@ -29,6 +29,9 @@ func TestRender(t *testing.T) {
 		"ip daddr @s_ads_dns counter drop",
 		`iifname != { "br-lan" } return`,
 		"type route hook output priority mangle",
+		"tcp flags syn / syn,rst tcp option maxseg size set rt mtu",
+		"chain mss_reply_01000000 {}",
+		"meta nfproto ipv4 ct direction reply ct mark and 0x0f000000 == 0x01000000 tcp flags syn,ack / syn,ack,rst jump mss_reply_01000000",
 		"elements = { 162.159.192.0/24 }",
 	} {
 		if !strings.Contains(script, want) {

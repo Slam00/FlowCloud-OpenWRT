@@ -66,6 +66,9 @@ func StatusPath(runDir string) string { return filepath.Join(runDir, "status.jso
 // Run serves until ctx ends, reloading the config on every Reload signal.
 func (d *Daemon) Run(ctx context.Context, signals Signals) error {
 	_ = os.MkdirAll(d.opts.RunDir, 0o755)
+	// The init script's restart leaves this flag so the stopping daemon keeps
+	// dnsmasq pointed at FlowCloud; the new daemon clears it.
+	_ = os.Remove(d.restartFlag())
 	_ = os.WriteFile(filepath.Join(d.opts.RunDir, "flowcloudd.pid"), []byte(fmt.Sprint(os.Getpid())), 0o644)
 	defer os.Remove(filepath.Join(d.opts.RunDir, "flowcloudd.pid"))
 	d.board.update(func(status *Status) {
@@ -129,7 +132,7 @@ func (d *Daemon) runOnce(ctx context.Context, updateLists <-chan struct{}) error
 			if !tunnel.Enabled {
 				state = "disabled"
 			}
-			status.Tunnels = append(status.Tunnels, TunnelStatus{Name: tunnel.Name, Type: tunnel.Type, Device: tunnel.Device, State: state, PingMs: -1})
+			status.Tunnels = append(status.Tunnels, TunnelStatus{Name: tunnel.Name, Type: tunnel.Type, Device: tunnel.Device, State: state, PingMs: -1, MedianMs: -1})
 		}
 	})
 	if !cfg.Settings.Enabled {
@@ -157,9 +160,11 @@ func (d *Daemon) runOnce(ctx context.Context, updateLists <-chan struct{}) error
 	d.mutex.Unlock()
 
 	d.resolveSections()
-	if err := nft.Apply(d.ruleset().Render()); err != nil {
+	ruleset := d.ruleset()
+	if err := nft.Apply(ruleset.Render()); err != nil {
 		return err
 	}
+	d.restoreLearned(ruleset)
 	route.Cleanup(config.MaxTunnels)
 	for _, tunnel := range cfg.Tunnels {
 		if tunnel.Enabled {
@@ -192,9 +197,29 @@ func (d *Daemon) runOnce(ctx context.Context, updateLists <-chan struct{}) error
 		d.warn("podkop is running: both services redirect DNS and mark traffic; disable one of them")
 	}
 
+	// Only tunnels an enabled section routes to are brought up: an unused WARP
+	// tunnel would keep probing endpoints and holding memory for nothing.
+	used := map[string]bool{}
+	d.mutex.Lock()
+	for _, section := range d.activeSections() {
+		if section.Action == config.ActionTunnel {
+			used[section.Tunnel] = true
+		}
+	}
+	d.mutex.Unlock()
 	var wait sync.WaitGroup
 	for _, tunnel := range cfg.Tunnels {
 		if !tunnel.Enabled {
+			continue
+		}
+		if !used[tunnel.Name] {
+			d.board.tunnel(tunnel.Name, func(status *TunnelStatus) {
+				status.State = "idle"
+				status.Error = ""
+			})
+			if tunnel.Type == config.TunnelWarp {
+				removeWarpDevice(tunnel.Device)
+			}
 			continue
 		}
 		wait.Add(1)
@@ -240,6 +265,7 @@ func (d *Daemon) shutdown(final bool) {
 	d.mutex.Lock()
 	cfg := d.cfg
 	d.mutex.Unlock()
+	d.saveLearned()
 	_ = nft.Delete()
 	route.Cleanup(config.MaxTunnels)
 	if cfg != nil {
@@ -248,7 +274,8 @@ func (d *Daemon) shutdown(final bool) {
 				removeWarpDevice(tunnel.Device)
 			}
 		}
-		if final && cfg.Settings.DnsmasqIntegration {
+		_, restarting := os.Stat(d.restartFlag())
+		if final && cfg.Settings.DnsmasqIntegration && restarting != nil {
 			_ = restoreDnsmasq(cfg.Settings.DNSListen, filepath.Join(d.opts.StateDir, "dnsmasq-backup.json"))
 		}
 	}
@@ -311,7 +338,7 @@ func (d *Daemon) sectionMark(section *config.Section) (uint32, bool) {
 }
 
 func (d *Daemon) bypassPrefixes() []netip.Prefix {
-	prefixes := warpBypass()
+	var prefixes []netip.Prefix
 	for _, extra := range d.bypass {
 		prefixes = append(prefixes, extra...)
 	}
@@ -387,14 +414,21 @@ func (d *Daemon) setBypass(tunnel string, prefixes []netip.Prefix) {
 	for index, prefix := range all {
 		parts[index] = prefix.String()
 	}
-	script := fmt.Sprintf("flush set inet %s bypass\nadd element inet %s bypass { %s }\n", nft.Table, nft.Table, strings.Join(parts, ", "))
+	script := fmt.Sprintf("flush set inet %s bypass\n", nft.Table)
+	if len(parts) > 0 {
+		script += fmt.Sprintf("add element inet %s bypass { %s }\n", nft.Table, strings.Join(parts, ", "))
+	}
 	if err := nft.Apply(script); err != nil {
 		log.Printf("bypass: %v", err)
 	}
 }
 
 func (d *Daemon) runLists(ctx context.Context, updateLists <-chan struct{}) {
+	// failed is set when some lists did not download; they are retried soon
+	// instead of at the next daily update (at boot DNS is often not up yet).
+	failed := false
 	update := func() {
+		failed = false
 		d.mutex.Lock()
 		var sources []lists.Source
 		for _, section := range d.activeSections() {
@@ -427,11 +461,17 @@ func (d *Daemon) runLists(ctx context.Context, updateLists <-chan struct{}) {
 			status.ListErrors = messages
 		})
 		log.Printf("lists updated: %d sources, %d errors", len(sources), len(errs))
+		failed = len(errs) > 0
 	}
 	update()
 	ticker := time.NewTicker(d.cfg.Settings.UpdateInterval)
 	defer ticker.Stop()
 	for {
+		// A nil channel never fires: the retry is armed only after a failure.
+		var retry <-chan time.Time
+		if failed {
+			retry = time.After(listRetryDelay)
+		}
 		select {
 		case <-ctx.Done():
 			return
@@ -439,9 +479,13 @@ func (d *Daemon) runLists(ctx context.Context, updateLists <-chan struct{}) {
 			update()
 		case <-updateLists:
 			update()
+		case <-retry:
+			update()
 		}
 	}
 }
+
+const listRetryDelay = 2 * time.Minute
 
 func (d *Daemon) refreshStatus() {
 	d.mutex.Lock()
@@ -495,3 +539,47 @@ func endpointPrefixes(endpoints []string) []netip.Prefix {
 }
 
 var errStopped = errors.New("stopped")
+
+func (d *Daemon) restartFlag() string { return filepath.Join(d.opts.RunDir, "restarting") }
+
+func (d *Daemon) learnedPath() string { return filepath.Join(d.opts.RunDir, "learned.json") }
+
+// saveLearned keeps the addresses learned through DNS across a reload or
+// restart: without them established flows would leave their tunnel and new
+// ones would go direct until clients ask DNS again.
+func (d *Daemon) saveLearned() {
+	d.mutex.Lock()
+	var sets []string
+	if d.cfg != nil {
+		for _, section := range d.activeSections() {
+			sets = append(sets, nft.DNSSet(section.Name))
+		}
+	}
+	d.mutex.Unlock()
+	elements, err := nft.Dump(sets)
+	if err != nil || len(elements) == 0 {
+		return
+	}
+	data, err := nft.MarshalElements(elements, time.Now())
+	if err == nil {
+		_ = os.WriteFile(d.learnedPath(), data, 0o600)
+	}
+}
+
+func (d *Daemon) restoreLearned(ruleset nft.Ruleset) {
+	data, err := os.ReadFile(d.learnedPath())
+	if err != nil {
+		return
+	}
+	_ = os.Remove(d.learnedPath())
+	existing := map[string]bool{}
+	for _, rule := range ruleset.Rules {
+		existing[nft.DNSSet(rule.Section)] = true
+	}
+	elements := nft.UnmarshalElements(data, time.Now())
+	if err := nft.Restore(elements, existing); err != nil {
+		log.Printf("learned addresses not restored: %v", err)
+		return
+	}
+	log.Printf("restored %d learned addresses", len(elements))
+}
