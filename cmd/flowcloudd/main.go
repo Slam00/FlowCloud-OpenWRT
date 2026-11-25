@@ -20,6 +20,8 @@ import (
 
 	"flowcloud-openwrt/internal/daemon"
 	"flowcloud-openwrt/internal/lists"
+	"flowcloud-openwrt/internal/netx"
+	"flowcloud-openwrt/internal/zapret"
 )
 
 var version = "dev"
@@ -30,6 +32,9 @@ const usage = `usage: flowcloudd <command>
   status [-json] show tunnels, sections and DNS counters
   update-lists   download the section lists now
   presets        print the community lists as JSON
+  probe [-zapret|-direct|-tunnel N] URL...
+                 fetch URLs the way the service tests them, through zapret2,
+                 directly or through tunnel number N
   version        print the version
 `
 
@@ -44,6 +49,9 @@ func main() {
 	stateDir := flags.String("state", "/etc/flowcloud", "persistent state directory")
 	runDir := flags.String("rundir", "/var/run/flowcloud", "runtime directory")
 	asJSON := flags.Bool("json", false, "print JSON")
+	viaZapret := flags.Bool("zapret", false, "probe through zapret2")
+	viaDirect := flags.Bool("direct", false, "probe directly")
+	viaTunnel := flags.Int("tunnel", 0, "probe through the tunnel with this index")
 	_ = flags.Parse(args)
 
 	switch command {
@@ -57,6 +65,27 @@ func main() {
 		signalDaemon(*runDir, syscall.SIGUSR1)
 	case "presets":
 		printPresets()
+	case "probe":
+		mark := netx.MarkDirect
+		switch {
+		case *viaZapret:
+			mark = netx.MarkZapret
+		case *viaTunnel > 0:
+			mark = netx.TunnelMark(*viaTunnel)
+		case *viaDirect:
+			mark = netx.MarkDirect
+		}
+		ok := true
+		for _, result := range zapret.Probe(context.Background(), flags.Args(), mark) {
+			state := "ok"
+			if !result.OK {
+				state, ok = "FAIL "+result.Error, false
+			}
+			fmt.Printf("%-60s %6d ms %8d bytes  %s\n", result.URL, result.Ms, result.Bytes, state)
+		}
+		if !ok {
+			os.Exit(1)
+		}
 	case "version":
 		fmt.Println(version)
 	default:

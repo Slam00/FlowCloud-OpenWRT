@@ -9,13 +9,18 @@ import (
 	"time"
 )
 
-// Marks the daemon owns: four bits of the packet mark. 0x01-0x0d select a
+// Marks the daemon owns: four bits of the packet mark. 0x01-0x0c select a
 // tunnel, MarkDirect keeps a packet on the main routing table and out of
 // every section (it has no ip rule of its own).
 const (
 	MarkMask   uint32 = 0x0f000000
 	MarkShift         = 24
 	MarkDirect uint32 = 0x0e000000
+	// MarkZapret routes like MarkDirect, but the first packets of each flow
+	// go through nfqws2 (zapret2) for DPI bypass.
+	MarkZapret uint32 = 0x0d000000
+	// DesyncMark is what nfqws2 puts on packets it generates.
+	DesyncMark uint32 = 0x40000000
 )
 
 // TunnelMark returns the fwmark of the tunnel with this 1-based index.

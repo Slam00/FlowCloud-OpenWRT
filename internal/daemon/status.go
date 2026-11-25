@@ -63,6 +63,7 @@ type Status struct {
 	ListErrors   []string        `json:"list_errors,omitempty"`
 	DNS          DNSStatus       `json:"dns"`
 	Warnings     []string        `json:"warnings,omitempty"`
+	Zapret       *ZapretStatus   `json:"zapret,omitempty"`
 	Error        string          `json:"error,omitempty"`
 }
 

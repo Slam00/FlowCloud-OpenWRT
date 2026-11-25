@@ -86,6 +86,39 @@ function qualityCell(t) {
 	]);
 }
 
+var ZAPRET_STATES = {
+	starting: [ _('Запуск'), '#c98a14' ],
+	ok: [ _('Работает'), '#2e9a5b' ],
+	failing: [ _('Не открывается'), '#c94141' ],
+	searching: [ _('Подбор стратегии'), '#c98a14' ],
+	error: [ _('Ошибка'), '#c94141' ],
+	unavailable: [ _('Не установлен'), '#888' ]
+};
+
+function renderZapret(z) {
+	var state = ZAPRET_STATES[z.state] || [ z.state, '#888' ];
+	var rows = (z.results || []).map(function(r) {
+		return E('tr', { 'class': 'tr' }, [
+			E('td', { 'class': 'td' }, E('code', {}, r.url)),
+			E('td', { 'class': 'td' }, r.ok
+				? E('span', { 'style': 'color:#2e9a5b' }, _('открывается, %d мс').format(r.ms))
+				: E('span', { 'style': 'color:#c94141' }, r.error || _('не открывается')))
+		]);
+	});
+	return E('div', {}, [
+		E('h3', {}, _('zapret2')),
+		E('p', {}, [
+			badge(state[0], state[1]), ' ',
+			z.label ? _('стратегия: %s').format(z.label) : '',
+			z.auto ? E('em', {}, ' (' + _('автоподбор') + ')') : '',
+			z.switches ? ' · ' + _('смен стратегии: %d').format(z.switches) : '',
+			z.checked_at ? ' · ' + _('проверено %s').format(formatTime(z.checked_at)) : ''
+		]),
+		z.error ? E('div', { 'style': 'color:#c94141' }, z.error) : '',
+		rows.length ? E('table', { 'class': 'table' }, rows) : ''
+	]);
+}
+
 function formatTime(unix) {
 	if (!unix)
 		return '—';
@@ -134,7 +167,7 @@ function renderStatus(status) {
 		])
 	].concat(tunnelRows)));
 
-	var actionLabels = { tunnel: '→ ', direct: _('напрямую'), block: _('блокировка') };
+	var actionLabels = { tunnel: '→ ', direct: _('напрямую'), block: _('блокировка'), zapret: _('zapret2') };
 	var sectionRows = (status.sections || []).map(function(s) {
 		var target = s.action == 'tunnel' ? '→ ' + s.tunnel : actionLabels[s.action];
 		var notes = [];
@@ -162,6 +195,9 @@ function renderStatus(status) {
 			E('th', { 'class': 'th' }, '')
 		])
 	].concat(sectionRows)));
+
+	if (status.zapret && status.zapret.active)
+		nodes.push(renderZapret(status.zapret));
 
 	var dns = status.dns || {};
 	nodes.push(E('p', {}, [
@@ -209,6 +245,7 @@ return view.extend({
 		o.value('tunnel', _('Через туннель'));
 		o.value('direct', _('Напрямую (исключение)'));
 		o.value('block', _('Блокировать'));
+		o.value('zapret', _('Через zapret2 (обход DPI без туннеля)'));
 		o.default = 'tunnel';
 
 		o = s.option(form.ListValue, 'tunnel', _('Туннель'));
@@ -298,6 +335,45 @@ return view.extend({
 		o = s.option(form.Flag, 'fail_closed', _('Не пускать мимо туннеля'),
 			_('Если туннель недоступен, трафик его секций блокируется, а не идёт напрямую.'));
 		o.default = '0';
+
+		/* zapret2 */
+		s = m.section(form.NamedSection, 'zapret', 'zapret', _('zapret2'),
+			_('Обход DPI без туннеля: трафик секций с действием «Через zapret2» идёт напрямую с вашего IP, а первые пакеты каждого соединения обрабатывает nfqws2 из <a href="%s" target="_blank">zapret2</a>. Устанавливается отдельно: install.sh спрашивает об этом при установке.').format('https://github.com/bol-van/zapret2'));
+		s.addremove = false;
+
+		o = s.option(form.Flag, 'enabled', _('Включить zapret2'));
+		o.default = '1';
+		o.rmempty = false;
+
+		o = s.option(form.ListValue, 'strategy', _('Стратегия'),
+			_('В режиме «Автоподбор» FlowCloud проверяет тестовые адреса и, если они перестали открываться, перебирает стратегии и запоминает первую рабочую.'));
+		o.value('auto', _('Автоподбор'));
+		[
+			[ 'fake_md5_disorder', 'fake (tcp_md5) + multidisorder' ],
+			[ 'fake_rndsni_seqovl', 'fake (rnd SNI) + multisplit seqovl' ],
+			[ 'seqovl', 'multisplit seqovl' ],
+			[ 'disorder', 'multidisorder' ],
+			[ 'fake_badsum_disorder', 'fake (badsum) + multidisorder' ],
+			[ 'fake_autottl_split', 'fake (autottl) + multisplit' ],
+			[ 'fake_ttl4_disorder', 'fake (ttl 4) + multidisorder' ],
+			[ 'double_fake_disorder', '2 fakes (tcp_md5) + multidisorder' ]
+		].forEach(function(v) { o.value(v[0], v[1]); });
+		o.value('custom', _('Свои аргументы nfqws2'));
+		o.default = 'auto';
+
+		o = s.option(form.TextValue, 'custom_args', _('Аргументы nfqws2'),
+			_('Профили nfqws2 целиком (--filter-tcp=… --lua-desync=… --new …). Очередь, марку и Lua-библиотеки FlowCloud добавляет сам.'));
+		o.rows = 4;
+		o.depends('strategy', 'custom');
+
+		o = s.option(form.DynamicList, 'test_url', _('Тестовые адреса'),
+			_('Что должно открываться через zapret2. Адрес считается рабочим, если ответ дошёл до конца или пришло больше 64 КБ (так ловится «заморозка» соединения после 16 КБ).'));
+		o.placeholder = 'https://www.youtube.com/';
+		o.validate = validateURL;
+
+		o = s.option(form.Value, 'check_interval', _('Проверять каждые, с'));
+		o.datatype = 'range(60,86400)';
+		o.placeholder = '300';
 
 		/* Settings */
 		s = m.section(form.NamedSection, 'settings', 'settings', _('Настройки'));

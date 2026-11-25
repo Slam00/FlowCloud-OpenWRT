@@ -238,6 +238,16 @@ func (d *Daemon) runOnce(ctx context.Context, updateLists <-chan struct{}) error
 		defer wait.Done()
 		d.runLists(ctx, updateLists)
 	}()
+	d.mutex.Lock()
+	runZapret := cfg.Zapret.Enabled && d.zapretWanted()
+	d.mutex.Unlock()
+	if runZapret {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			d.runZapret(ctx, cfg.Zapret)
+		}()
+	}
 
 	d.board.update(func(status *Status) { status.Running = true })
 	ticker := time.NewTicker(2 * time.Second)
@@ -332,6 +342,8 @@ func (d *Daemon) sectionMark(section *config.Section) (uint32, bool) {
 		return 0, true
 	case config.ActionDirect:
 		return netx.MarkDirect, false
+	case config.ActionZapret:
+		return netx.MarkZapret, false
 	default:
 		return netx.TunnelMark(d.cfg.Tunnel(section.Tunnel).Index), false
 	}
@@ -353,6 +365,7 @@ func (d *Daemon) ruleset() nft.Ruleset {
 		RouteRouter:      d.cfg.Settings.RouteRouterTraffic,
 		Bypass:           d.bypassPrefixes(),
 		DNSTimeout:       d.cfg.Settings.MinSetTimeout,
+		ZapretQueue:      d.zapretQueue(),
 	}
 	for _, section := range d.activeSections() {
 		mark, block := d.sectionMark(section)

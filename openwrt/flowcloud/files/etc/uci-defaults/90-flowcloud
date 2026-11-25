@@ -1,4 +1,15 @@
 #!/bin/sh
+# Add sections that configs from older versions lack.
+if ! uci -q get flowcloud.zapret >/dev/null; then
+	uci set flowcloud.zapret=zapret
+	uci set flowcloud.zapret.enabled=1
+	uci set flowcloud.zapret.strategy=auto
+	uci set flowcloud.zapret.check_interval=300
+	uci add_list flowcloud.zapret.test_url='https://www.youtube.com/'
+	uci add_list flowcloud.zapret.test_url='https://i.ytimg.com/generate_204'
+	uci add_list flowcloud.zapret.test_url='https://redirector.googlevideo.com/report_mapping'
+	uci commit flowcloud
+fi
 # Load the fw4 includes that forward and masquerade tunnelled traffic.
 fw4 -q reload 2>/dev/null
 exit 0

@@ -16,7 +16,8 @@ func TestRender(t *testing.T) {
 			{Section: "yt", Mark: 0x01000000, Subnets: []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")}},
 			{Section: "ads", Block: true},
 		},
-		DNSTimeout: time.Hour,
+		DNSTimeout:  time.Hour,
+		ZapretQueue: 300,
 	}.Render()
 	for _, want := range []string{
 		"delete table inet flowcloud",
@@ -30,6 +31,9 @@ func TestRender(t *testing.T) {
 		`iifname != { "br-lan" } return`,
 		"type route hook output priority mangle",
 		"tcp flags syn / syn,rst tcp option maxseg size set rt mtu",
+		"tcp dport { 80, 443 } ct original packets 1-12 counter queue num 300 bypass",
+		"tcp sport { 80, 443 } ct reply packets 1-12 counter queue num 300 bypass",
+		"meta mark and 0x40000000 != 0 return",
 		"chain mss_reply_01000000 {}",
 		"meta nfproto ipv4 ct direction reply ct mark and 0x0f000000 == 0x01000000 tcp flags syn,ack / syn,ack,rst jump mss_reply_01000000",
 		"elements = { 162.159.192.0/24 }",

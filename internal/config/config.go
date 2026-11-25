@@ -21,9 +21,10 @@ const (
 	ActionTunnel = "tunnel"
 	ActionBlock  = "block"
 	ActionDirect = "direct"
+	ActionZapret = "zapret"
 
 	// MaxTunnels is bounded by the four fwmark bits the daemon owns.
-	MaxTunnels = 13
+	MaxTunnels = 12
 )
 
 type Settings struct {
@@ -73,7 +74,21 @@ type Section struct {
 	Index              int
 }
 
+// Zapret configures the optional zapret2 DPI bypass used by "zapret" sections.
+type Zapret struct {
+	Enabled bool
+	Binary  string
+	LuaDir  string
+	Queue   int
+	// Strategy is "auto", a built-in strategy name or "custom".
+	Strategy      string
+	CustomArgs    string
+	CheckInterval time.Duration
+	TestURLs      []string
+}
+
 type Config struct {
+	Zapret   Zapret
 	Settings Settings
 	Tunnels  []*Tunnel
 	Sections []*Section
@@ -96,7 +111,7 @@ var (
 
 // FromUCI builds and validates the configuration.
 func FromUCI(sections []*uci.Section) (*Config, error) {
-	config := &Config{Settings: defaultSettings()}
+	config := &Config{Settings: defaultSettings(), Zapret: defaultZapret()}
 	for _, section := range sections {
 		switch section.Type {
 		case "settings":
@@ -109,6 +124,10 @@ func FromUCI(sections []*uci.Section) (*Config, error) {
 				return nil, err
 			}
 			config.Tunnels = append(config.Tunnels, tunnel)
+		case "zapret":
+			if err := readZapret(&config.Zapret, section); err != nil {
+				return nil, err
+			}
 		case "section":
 			config.Sections = append(config.Sections, readSection(section))
 		}
@@ -260,7 +279,7 @@ func readSection(section *uci.Section) *Section {
 		RemoteSubnetLists: section.List("remote_subnet_lists"),
 	}
 	switch result.Action {
-	case ActionTunnel, ActionBlock, ActionDirect:
+	case ActionTunnel, ActionBlock, ActionDirect, ActionZapret:
 	default:
 		result.Action = ActionTunnel
 	}
@@ -364,4 +383,54 @@ func ParseSubnets(text string) ([]netip.Prefix, []string) {
 		}
 	}
 	return subnets, invalid
+}
+
+func defaultZapret() Zapret {
+	return Zapret{
+		Enabled:       true,
+		Binary:        "/usr/lib/flowcloud/zapret2/nfqws2",
+		LuaDir:        "/usr/lib/flowcloud/zapret2/lua",
+		Queue:         300,
+		Strategy:      "auto",
+		CheckInterval: 5 * time.Minute,
+		TestURLs: []string{
+			"https://www.youtube.com/",
+			"https://i.ytimg.com/generate_204",
+			"https://redirector.googlevideo.com/report_mapping",
+		},
+	}
+}
+
+func readZapret(zapret *Zapret, section *uci.Section) error {
+	zapret.Enabled = section.Bool("enabled", zapret.Enabled)
+	zapret.Binary = section.Get("binary", zapret.Binary)
+	zapret.LuaDir = section.Get("lua_dir", zapret.LuaDir)
+	zapret.Strategy = section.Get("strategy", zapret.Strategy)
+	zapret.CustomArgs = section.Get("custom_args", "")
+	if value := section.Get("queue", ""); value != "" {
+		queue, err := strconv.Atoi(value)
+		if err != nil || queue < 0 || queue > 65535 {
+			return fmt.Errorf("zapret: queue must be 0-65535")
+		}
+		zapret.Queue = queue
+	}
+	if value := section.Get("check_interval", ""); value != "" {
+		seconds, err := strconv.Atoi(value)
+		if err != nil || seconds < 60 || seconds > 86400 {
+			return fmt.Errorf("zapret: check_interval must be 60-86400 seconds")
+		}
+		zapret.CheckInterval = time.Duration(seconds) * time.Second
+	}
+	if urls := section.List("test_url"); len(urls) > 0 {
+		for _, url := range urls {
+			if !strings.HasPrefix(url, "https://") && !strings.HasPrefix(url, "http://") {
+				return fmt.Errorf("zapret: test URL %q must start with http:// or https://", url)
+			}
+		}
+		zapret.TestURLs = urls
+	}
+	if zapret.Strategy == "custom" && strings.TrimSpace(zapret.CustomArgs) == "" {
+		return fmt.Errorf("zapret: the custom strategy needs nfqws2 arguments")
+	}
+	return nil
 }

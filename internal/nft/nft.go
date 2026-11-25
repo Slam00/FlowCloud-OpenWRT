@@ -41,7 +41,14 @@ type Ruleset struct {
 	Rules  []Rule
 	// DNSTimeout is the default lifetime of IPs learned from DNS.
 	DNSTimeout time.Duration
+	// ZapretQueue is the NFQUEUE of nfqws2; 0 leaves "zapret" sections
+	// going direct without DPI bypass.
+	ZapretQueue int
 }
+
+// zapretPackets is how many packets of a flow nfqws2 sees in each direction:
+// enough for the handshake and the first request, little CPU afterwards.
+const zapretPackets = 12
 
 // DNSSet and NetSet name a section's sets.
 func DNSSet(section string) string { return "s_" + section + "_dns" }
@@ -149,8 +156,32 @@ func (r Ruleset) Render() string {
 	}
 	b.WriteString("\t}\n")
 
+	if r.ZapretQueue > 0 {
+		zapret := fmt.Sprintf("0x%08x", netx.MarkZapret)
+		desync := fmt.Sprintf("0x%08x", netx.DesyncMark)
+		queue := fmt.Sprintf("counter queue num %d bypass", r.ZapretQueue)
+		// After NAT, like zapret's POSTNAT mode. Packets nfqws2 generated carry
+		// its desync mark and must not be queued again.
+		b.WriteString("\tchain zapret_post {\n\t\ttype filter hook postrouting priority 101; policy accept;\n")
+		fmt.Fprintf(&b, "\t\tmeta mark and %s != 0 return\n", desync)
+		fmt.Fprintf(&b, "\t\tmeta mark and %s != %s return\n", mask, zapret)
+		// The daemon's own test sockets carry the mark without a ct mark.
+		fmt.Fprintf(&b, "\t\tct mark set ct mark or %s\n", zapret)
+		fmt.Fprintf(&b, "\t\ttcp dport { 80, 443 } ct original packets 1-%d %s\n", zapretPackets, queue)
+		fmt.Fprintf(&b, "\t\tudp dport 443 ct original packets 1-%d %s\n", zapretPackets, queue)
+		b.WriteString("\t}\n")
+		// Replies (SYN,ACK TTL for autottl, server hello) before NAT.
+		b.WriteString("\tchain zapret_pre {\n\t\ttype filter hook prerouting priority -99; policy accept;\n")
+		fmt.Fprintf(&b, "\t\tct mark and %s != %s return\n", mask, zapret)
+		fmt.Fprintf(&b, "\t\ttcp sport { 80, 443 } ct reply packets 1-%d %s\n", zapretPackets, queue)
+		fmt.Fprintf(&b, "\t\tudp sport 443 ct reply packets 1-%d %s\n", zapretPackets, queue)
+		b.WriteString("\t}\n")
+	}
+
 	if r.RouteRouter {
 		b.WriteString("\tchain output {\n\t\ttype route hook output priority mangle; policy accept;\n")
+		// Packets nfqws2 generated belong to flows already classified.
+		fmt.Fprintf(&b, "\t\tmeta mark and 0x%08x != 0 return\n", netx.DesyncMark)
 		// Sockets that already carry a mark (WireGuard with fwmark, the
 		// daemon's own direct sockets, health checks) choose their route.
 		fmt.Fprintf(&b, "\t\tmeta mark and %s != 0 return\n", mask)
