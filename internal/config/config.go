@@ -27,6 +27,15 @@ const (
 	MaxTunnels = 12
 )
 
+var (
+	// DefaultWarpTestURLs are what a WARP endpoint must open to be chosen.
+	DefaultWarpTestURLs = []string{"https://www.youtube.com/", "https://telegram.org/"}
+	// DefaultAvoidColos: Cloudflare in Moscow and Saint Petersburg. From
+	// there WARP traffic leaves through Russian networks, so blocked sites
+	// stay blocked; Stockholm answers as fast from the same networks.
+	DefaultAvoidColos = []string{"DME", "LED"}
+)
+
 type Settings struct {
 	Enabled            bool
 	DNSListen          string
@@ -55,6 +64,12 @@ type Tunnel struct {
 	// 0 disables a check.
 	MaxPingMs  int
 	MaxLossPct int
+	// TestURLs must open through a WARP endpoint before it is chosen, and
+	// through the tunnel once it is applied. Empty: only the ping.
+	TestURLs []string
+	// AvoidColos are Cloudflare locations (IATA codes from cdn-cgi/trace)
+	// chosen only when no other endpoint opens the test URLs.
+	AvoidColos []string
 	// Index is 1-based and stable for a given config: it selects the fwmark
 	// and the routing table.
 	Index int
@@ -212,6 +227,30 @@ func readTunnel(section *uci.Section) (*Tunnel, error) {
 		HealthInterval: 15 * time.Second,
 		MaxPingMs:      300,
 		MaxLossPct:     30,
+		TestURLs:       append([]string(nil), DefaultWarpTestURLs...),
+		AvoidColos:     append([]string(nil), DefaultAvoidColos...),
+	}
+	if urls := section.List("test_url"); len(urls) > 0 {
+		for _, url := range urls {
+			if !strings.HasPrefix(url, "https://") && !strings.HasPrefix(url, "http://") {
+				return nil, fmt.Errorf("tunnel %s: test URL %q must start with http:// or https://", section.Name, url)
+			}
+		}
+		tunnel.TestURLs = urls
+	}
+	if !section.Bool("site_test", true) {
+		tunnel.TestURLs = nil
+	}
+	if colos := section.List("avoid_colo"); len(colos) > 0 {
+		tunnel.AvoidColos = nil
+		for _, colo := range colos {
+			// "-" alone keeps the list empty: prefer no location.
+			for _, code := range strings.Fields(strings.ToUpper(colo)) {
+				if code != "-" {
+					tunnel.AvoidColos = append(tunnel.AvoidColos, code)
+				}
+			}
+		}
 	}
 	if !sectionName.MatchString(tunnel.Name) {
 		return nil, fmt.Errorf("tunnel name %q: use letters, digits and _", tunnel.Name)

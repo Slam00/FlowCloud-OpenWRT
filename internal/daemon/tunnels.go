@@ -20,6 +20,7 @@ import (
 	"flowcloud-openwrt/internal/system"
 	"flowcloud-openwrt/internal/tunnel"
 	"flowcloud-openwrt/internal/warp"
+	"flowcloud-openwrt/internal/zapret"
 )
 
 const (
@@ -196,7 +197,13 @@ func (d *Daemon) runWarp(ctx context.Context, t *config.Tunnel) {
 	}
 	selectBest := func(exclude string) (warp.Selection, error) {
 		selectContext, cancel := context.WithTimeout(ctx, selectTimeout)
-		selection, err := warp.Select(selectContext, probePeer, cache, parallel, netx.MarkDirect, exclude)
+		selection, err := warp.Select(selectContext, probePeer, cache, warp.Options{
+			Parallel:   parallel,
+			Fwmark:     netx.MarkDirect,
+			Exclude:    exclude,
+			TestURLs:   t.TestURLs,
+			AvoidColos: t.AvoidColos,
+		})
 		cancel()
 		// Return the probes' memory before the tunnel settles down.
 		debug.FreeOSMemory()
@@ -210,14 +217,20 @@ func (d *Daemon) runWarp(ctx context.Context, t *config.Tunnel) {
 		if err := route.SetDevice(t.Index, t.Device, t.FailClosed); err != nil {
 			return err
 		}
-		log.Printf("tunnel %s: endpoint %s [%s %s] selected in %s, %s through it%s", t.Name, selection.Endpoint,
-			selection.Source, selection.Profile.Name, selection.Latency.Round(time.Millisecond),
-			selection.RTT.Round(time.Millisecond), reason)
+		sites := ""
+		if selection.SitesTotal > 0 {
+			sites = fmt.Sprintf(", test sites %d/%d", selection.SitesOK, selection.SitesTotal)
+		}
+		log.Printf("tunnel %s: endpoint %s [%s %s] exit %s selected in %s, %s through it%s%s", t.Name, selection.Endpoint,
+			selection.Source, selection.Profile.Name, orDash(selection.Colo), selection.Latency.Round(time.Millisecond),
+			selection.RTT.Round(time.Millisecond), sites, reason)
 		d.board.tunnel(t.Name, func(status *TunnelStatus) {
 			status.State = "up"
 			status.Endpoint = selection.Endpoint
 			status.Profile = selection.Profile.String()
 			status.Source = selection.Source
+			status.Colo = selection.Colo
+			status.Sites = nil
 			status.Switches++
 			status.Error = ""
 			status.MedianMs = -1
@@ -249,13 +262,47 @@ func (d *Daemon) runWarp(ctx context.Context, t *config.Tunnel) {
 		}
 
 		fresh := true
+		siteSwitches := 0
 		var window qualityWindow
 		for {
-			result := d.watch(ctx, t, mark, fresh, &window, limits, switchRequests)
+			checkSites := fresh && len(t.TestURLs) > 0 && siteSwitches < maxSiteSwitches
+			result := d.watch(ctx, t, mark, fresh, &window, limits, switchRequests, checkSites)
 			fresh = false
 			if result == watchStopped {
 				return
 			}
+			if result == watchSites {
+				// The probe account opened the test sites through this endpoint,
+				// the tunnel's own account does not: its exit may differ.
+				siteSwitches++
+				if siteSwitches >= maxSiteSwitches {
+					log.Printf("tunnel %s: test sites fail through %d endpoints in a row; keeping %s", t.Name, siteSwitches, selection.Endpoint)
+					d.board.tunnel(t.Name, func(status *TunnelStatus) {
+						status.Quality = fmt.Sprintf("тестовые сайты не открываются через WARP: проверено серверов подряд: %d, оставлен текущий", siteSwitches)
+					})
+					continue
+				}
+				log.Printf("tunnel %s: test sites do not open through %s; selecting another endpoint", t.Name, selection.Endpoint)
+				d.board.tunnel(t.Name, func(status *TunnelStatus) {
+					status.Quality = "тестовые сайты не открываются, подбор другого сервера…"
+				})
+				candidate, err := selectBest(selection.Endpoint)
+				if err == nil {
+					err = apply(candidate, "; test sites failed through "+selection.Endpoint)
+				}
+				if err != nil {
+					if ctx.Err() != nil {
+						return
+					}
+					log.Printf("tunnel %s: %v", t.Name, err)
+					continue
+				}
+				selection = candidate
+				window.reset()
+				fresh = true
+				continue
+			}
+			siteSwitches = 0
 			if result == watchSwitch {
 				// Asked from LuCI: any other working pair, faster or not.
 				log.Printf("tunnel %s: switching away from %s on request", t.Name, selection.Endpoint)
@@ -299,9 +346,12 @@ func (d *Daemon) runWarp(ctx context.Context, t *config.Tunnel) {
 			log.Printf("tunnel %s: endpoint %s has poor quality (%s); looking for a better one", t.Name, selection.Endpoint, reason)
 			d.board.tunnel(t.Name, func(status *TunnelStatus) { status.Quality = "поиск сервера лучше: " + reason })
 			candidate, err := selectBest(selection.Endpoint)
-			if err != nil || !limits.better(median, loss, candidate.RTT.Milliseconds()) {
+			sitesWorse := err == nil && candidate.SitesOK < candidate.SitesTotal
+			if err != nil || sitesWorse || !limits.better(median, loss, candidate.RTT.Milliseconds()) {
 				note := "лучше не найдено"
-				if err == nil {
+				if sitesWorse {
+					note = fmt.Sprintf("у найденного %s открываются не все тестовые сайты", candidate.Endpoint)
+				} else if err == nil {
 					note = fmt.Sprintf("лучший найденный %s: %d мс", candidate.Endpoint, candidate.RTT.Milliseconds())
 				}
 				log.Printf("tunnel %s: keeping %s (%s)", t.Name, selection.Endpoint, note)
@@ -329,7 +379,20 @@ const (
 	watchFailed
 	watchPoor
 	watchSwitch
+	watchSites
 )
+
+// maxSiteSwitches bounds endpoint changes in a row made because the test
+// sites did not open through the applied tunnel: if no exit opens them, the
+// tunnel stays on a working endpoint instead of hopping forever.
+const maxSiteSwitches = 3
+
+func orDash(value string) string {
+	if value == "" {
+		return "-"
+	}
+	return value
+}
 
 // pause waits for delay like sleep and reports watchSwitch when a manual
 // switch is requested meanwhile, watchStopped when ctx ends, else -1.
@@ -351,7 +414,7 @@ func pause(ctx context.Context, delay time.Duration, switchRequests <-chan struc
 // attempts for its first handshake), watchPoor when a full quality window
 // breaks a limit, watchSwitch on a manual switch request, or watchStopped
 // when ctx ends.
-func (d *Daemon) watch(ctx context.Context, t *config.Tunnel, mark uint32, fresh bool, window *qualityWindow, limits qualityLimits, switchRequests <-chan struct{}) watchResult {
+func (d *Daemon) watch(ctx context.Context, t *config.Tunnel, mark uint32, fresh bool, window *qualityWindow, limits qualityLimits, switchRequests <-chan struct{}, checkSites bool) watchResult {
 	failures := 0
 	attempts := failedPings
 	if fresh {
@@ -394,6 +457,25 @@ func (d *Daemon) watch(ctx context.Context, t *config.Tunnel, mark uint32, fresh
 				status.Error = err.Error()
 			}
 		})
+		if err == nil && checkSites {
+			// Once per new endpoint: the test sites through the tunnel itself,
+			// with its own account, the way LAN devices will reach them.
+			checkSites = false
+			results := zapret.Probe(ctx, t.TestURLs, mark)
+			if ctx.Err() != nil {
+				return watchStopped
+			}
+			passed := zapret.AllOK(results)
+			d.board.tunnel(t.Name, func(status *TunnelStatus) {
+				status.Sites = results
+				if passed && strings.HasPrefix(status.Quality, "тестовые сайты") {
+					status.Quality = ""
+				}
+			})
+			if !zapret.AllOK(results) {
+				return watchSites
+			}
+		}
 		if err != nil {
 			if failures >= attempts {
 				return watchFailed

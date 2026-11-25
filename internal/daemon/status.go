@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+
+	"flowcloud-openwrt/internal/zapret"
 )
 
 // TunnelStatus is what LuCI shows for one tunnel.
@@ -22,12 +24,16 @@ type TunnelStatus struct {
 	PingMs   int64  `json:"ping_ms"`
 	// MedianMs and LossPct cover the last quality window (two minutes at
 	// the default interval).
-	MedianMs  int64  `json:"median_ms"`
-	LossPct   int    `json:"loss_pct"`
-	Quality   string `json:"quality,omitempty"`
-	CheckedAt int64  `json:"checked_at,omitempty"`
-	Switches  int    `json:"switches"`
-	Error     string `json:"error,omitempty"`
+	MedianMs int64  `json:"median_ms"`
+	LossPct  int    `json:"loss_pct"`
+	Quality  string `json:"quality,omitempty"`
+	// Colo is the Cloudflare location a WARP tunnel exits from; Sites are
+	// the test URLs opened through the applied tunnel.
+	Colo      string             `json:"colo,omitempty"`
+	Sites     []zapret.URLResult `json:"sites,omitempty"`
+	CheckedAt int64              `json:"checked_at,omitempty"`
+	Switches  int                `json:"switches"`
+	Error     string             `json:"error,omitempty"`
 }
 
 type SectionStatus struct {

@@ -86,6 +86,29 @@ function qualityCell(t) {
 	]);
 }
 
+var COLO_NAMES = {
+	DME: _('Москва'), LED: _('Санкт-Петербург'), ARN: _('Стокгольм'), HEL: _('Хельсинки'),
+	WAW: _('Варшава'), FRA: _('Франкфурт'), AMS: _('Амстердам'), RIX: _('Рига'),
+	TLL: _('Таллин'), VNO: _('Вильнюс'), KBP: _('Киев'), IST: _('Стамбул')
+};
+
+function coloName(colo) {
+	return COLO_NAMES[colo] ? COLO_NAMES[colo] + ' (' + colo + ')' : colo;
+}
+
+// Test sites opened through the applied WARP tunnel.
+function sitesCell(sites) {
+	if (!sites || !sites.length)
+		return '';
+	return E('div', {}, sites.map(function(r) {
+		var host = r.url.replace(/^https?:\/\//, '').replace(/\/.*$/, '');
+		return E('span', {
+			'title': r.ok ? _('открывается, %d мс').format(r.ms) : (r.error || ''),
+			'style': 'margin-right:8px;color:' + (r.ok ? '#2e9a5b' : '#c94141')
+		}, (r.ok ? '✓ ' : '✗ ') + host);
+	}));
+}
+
 var ZAPRET_STATES = {
 	starting: [ _('Запуск'), '#c98a14' ],
 	ok: [ _('Работает'), '#2e9a5b' ],
@@ -165,6 +188,7 @@ function renderSummary(status) {
 		return chip(t.name, [
 			badge(STATE_LABELS[t.state] || t.state, STATE_COLORS[t.state] || '#888'),
 			t.state == 'up' ? pingCell(t.ping_ms) : '',
+			t.colo ? E('span', { 'style': 'color:#888', 'title': coloName(t.colo) }, t.colo) : '',
 			t.error && t.state != 'up' ? E('span', { 'style': 'color:#c94141;font-size:90%' }, '!') : ''
 		]);
 	});
@@ -195,11 +219,15 @@ function renderStatus(status, warpSwitch) {
 			E('td', { 'class': 'td' }, E('strong', {}, t.name)),
 			E('td', { 'class': 'td' }, t.type == 'warp' ? 'WARP' : _('Интерфейс')),
 			E('td', { 'class': 'td' }, badge(STATE_LABELS[t.state] || t.state, STATE_COLORS[t.state] || '#888')),
-			E('td', { 'class': 'td' }, E('code', {}, t.endpoint || '—')),
+			E('td', { 'class': 'td' }, [
+				E('code', {}, t.endpoint || '—'),
+				t.colo ? E('div', { 'style': 'font-size:90%;color:#888' }, _('выход: %s').format(coloName(t.colo))) : ''
+			]),
 			E('td', { 'class': 'td' }, pingCell(t.ping_ms)),
 			E('td', { 'class': 'td' }, qualityCell(t)),
 			E('td', { 'class': 'td' }, t.profile || ''),
 			E('td', { 'class': 'td' }, [
+				sitesCell(t.sites),
 				t.quality ? E('div', { 'style': 'color:#c98a14' }, t.quality) : '',
 				t.error ? E('div', { 'style': 'color:#c94141' }, t.error) : ''
 			]),
@@ -468,6 +496,25 @@ return view.extend({
 			_('Если за окно не прошло столько проверок или больше, сервер WARP меняется на любой рабочий. 0 — не проверять.'));
 		o.datatype = 'range(0,100)';
 		o.placeholder = '30';
+		o.depends('type', 'warp');
+
+		o = s.option(form.Flag, 'site_test', _('Проверять сайты при подборе'),
+			_('Сервер WARP выбирается, только если через него открываются тестовые сайты, а после переключения они проверяются ещё раз через сам туннель. Если не открываются, FlowCloud берёт другой сервер (до 3 раз подряд).'));
+		o.default = '1';
+		o.rmempty = false;
+		o.depends('type', 'warp');
+
+		o = s.option(form.DynamicList, 'test_url', _('Тестовые сайты'),
+			_('По умолчанию YouTube и Telegram. Сайт считается открытым, если ответ дошёл до конца или пришло больше 64 КБ.'));
+		o.placeholder = 'https://www.youtube.com/';
+		o.validate = validateURL;
+		o.depends({ 'type': 'warp', 'site_test': '1' });
+
+		o = s.option(form.DynamicList, 'avoid_colo', _('Избегать выхода в'),
+			_('Города Cloudflare (коды IATA), где WARP выходит в интернет через российские сети и блокировки остаются. Такой сервер выбирается, только если другие не открывают тестовые сайты. По умолчанию DME (Москва) и LED (Санкт-Петербург); «-» — не избегать ничего.'));
+		o.value('DME', _('DME — Москва'));
+		o.value('LED', _('LED — Санкт-Петербург'));
+		o.placeholder = 'DME';
 		o.depends('type', 'warp');
 
 		o = s.option(form.Flag, 'fail_closed', _('Не пускать мимо туннеля'),

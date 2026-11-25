@@ -89,3 +89,24 @@ func TestProfilesAreAcceptedByDevice(t *testing.T) {
 		}
 	}
 }
+
+func TestBetterSelectionRanksSitesThenColoThenRTT(t *testing.T) {
+	avoid := []string{"DME", "LED"}
+	moscowAll := Selection{Colo: "DME", SitesOK: 2, SitesTotal: 2, RTT: 26 * time.Millisecond}
+	stockholmAll := Selection{Colo: "ARN", SitesOK: 2, SitesTotal: 2, RTT: 45 * time.Millisecond}
+	stockholmHalf := Selection{Colo: "ARN", SitesOK: 1, SitesTotal: 2, RTT: 20 * time.Millisecond}
+	if !betterSelection(stockholmAll, moscowAll, avoid) {
+		t.Fatal("an exit outside the avoided locations must win when both open every site")
+	}
+	if !betterSelection(moscowAll, stockholmHalf, avoid) {
+		t.Fatal("opening more test sites must outrank the location")
+	}
+	fasterStockholm := stockholmAll
+	fasterStockholm.RTT = 30 * time.Millisecond
+	if !betterSelection(fasterStockholm, stockholmAll, avoid) {
+		t.Fatal("equal sites and location: the faster endpoint wins")
+	}
+	if avoided("arn", avoid) || !avoided("dme", avoid) {
+		t.Fatal("location codes compare case-insensitively")
+	}
+}

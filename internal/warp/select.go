@@ -4,11 +4,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	mrand "math/rand"
 	"net"
+	"net/http"
 	"net/netip"
+	"net/url"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/amnezia-vpn/amneziawg-go/v3/conn"
@@ -36,7 +41,39 @@ type Selection struct {
 	// the winner once its WireGuard session is up, comparable with tunnel pings.
 	Latency time.Duration
 	RTT     time.Duration
+	// Colo is the Cloudflare location the endpoint exits from ("" when not
+	// checked). SitesOK of SitesTotal test URLs opened through it.
+	Colo       string
+	SitesOK    int
+	SitesTotal int
+	SiteErrors []string
 }
+
+// Options tune a selection round.
+type Options struct {
+	Parallel int
+	// Fwmark marks probe sockets so they never loop back into a tunnel.
+	Fwmark uint32
+	// Exclude skips one endpoint, the current one when looking for another.
+	Exclude string
+	// TestURLs must open through the winner; AvoidColos are Cloudflare
+	// locations taken only when no other endpoint opens every test URL.
+	TestURLs   []string
+	AvoidColos []string
+}
+
+const (
+	// shortlistSize endpoints that answer the ping go on to the site test;
+	// collectWindow is how long the ping stage waits for more after the
+	// first answer.
+	shortlistSize = 6
+	collectWindow = 2 * time.Second
+	siteTimeout   = 8 * time.Second
+	// A test URL passes when its body ends or this much arrives: blocks
+	// often freeze a connection after the first 16 KB.
+	siteEnoughBytes = 64 * 1024
+	traceURL        = "https://1.1.1.1/cdn-cgi/trace"
+)
 
 const (
 	// ProbeTarget is Cloudflare's resolver, served from the same edge as the
@@ -128,30 +165,83 @@ func (t *probeTunnel) probe(ctx context.Context) (time.Duration, error) {
 	return time.Since(started), nil
 }
 
-// Select runs one selection round: up to `parallel` candidates are tested at a
-// time, each in its own userspace tunnel, and the first that passes wins.
-// Probe sockets carry fwmark so they never loop back into a tunnel.
-// exclude skips one endpoint, the current one when looking for a better pair.
-func Select(ctx context.Context, peer *Peer, cache *EndpointCache, parallel int, fwmark uint32, exclude string) (Selection, error) {
+// pinged is a candidate that answered the ping stage.
+type pinged struct {
+	candidate warpCandidate
+	rtt       time.Duration
+}
+
+// Select runs one selection round in two stages. The ping stage tests up to
+// opts.Parallel candidates at a time, each in its own userspace tunnel, and
+// keeps the first few that pass. The site stage then opens the shortlist one
+// at a time, fastest first: it reads the exit location and fetches the test
+// URLs, and the first endpoint that opens all of them outside the avoided
+// locations wins. One at a time because every probe tunnel uses the same
+// key, and a newer handshake takes the session from the older tunnel.
+func Select(ctx context.Context, peer *Peer, cache *EndpointCache, opts Options) (Selection, error) {
 	if peer == nil {
 		return Selection{}, errors.New("WARP account is missing")
 	}
+	started := time.Now()
+	shortlist, err := pingStage(ctx, peer, cache, opts)
+	if err != nil {
+		return Selection{}, err
+	}
+	sort.SliceStable(shortlist, func(i, j int) bool { return shortlist[i].rtt < shortlist[j].rtt })
+
+	var best Selection
+	found := false
+	if len(opts.TestURLs) == 0 && len(opts.AvoidColos) == 0 {
+		best = Selection{Endpoint: shortlist[0].candidate.endpoint, Profile: shortlist[0].candidate.profile,
+			Source: string(shortlist[0].candidate.source), RTT: shortlist[0].rtt}
+		found = true
+	} else {
+		addresses := resolveTestHosts(ctx, opts.TestURLs)
+		for _, entry := range shortlist {
+			if ctx.Err() != nil {
+				return Selection{}, ctx.Err()
+			}
+			selection, err := evaluate(ctx, peer, entry.candidate, opts, addresses)
+			if err != nil {
+				continue
+			}
+			if !found || betterSelection(selection, best, opts.AvoidColos) {
+				best, found = selection, true
+			}
+			if selection.SitesOK == selection.SitesTotal && !avoided(selection.Colo, opts.AvoidColos) {
+				break
+			}
+		}
+	}
+	if !found {
+		return Selection{}, errors.New("no WARP endpoint passed the second check")
+	}
+	best.Latency = time.Since(started)
+	cache.remember(warpCandidate{endpoint: best.Endpoint, profile: best.Profile, source: candidateSource(best.Source)}, best.RTT)
+	return best, nil
+}
+
+// pingStage returns up to shortlistSize candidates that passed the ping,
+// collecting for collectWindow after the first one. All its tunnels are
+// closed when it returns.
+func pingStage(ctx context.Context, peer *Peer, cache *EndpointCache, opts Options) ([]pinged, error) {
+	parallel := opts.Parallel
 	if parallel < 1 {
 		parallel = 1
 	}
 	rng := mrand.New(mrand.NewSource(time.Now().UnixNano()))
 	candidates := buildWarpCandidates(peer.RegisteredHost, peer.RegisteredPort, cache.snapshot(), rng)
-	if exclude != "" {
+	if opts.Exclude != "" {
 		kept := candidates[:0]
 		for _, candidate := range candidates {
-			if candidate.endpoint != exclude {
+			if candidate.endpoint != opts.Exclude {
 				kept = append(kept, candidate)
 			}
 		}
 		candidates = kept
 	}
 	if len(candidates) == 0 {
-		return Selection{}, errors.New("no WARP endpoint candidates")
+		return nil, errors.New("no WARP endpoint candidates")
 	}
 	type result struct {
 		candidate warpCandidate
@@ -162,8 +252,13 @@ func Select(ctx context.Context, peer *Peer, cache *EndpointCache, parallel int,
 	defer cancel()
 	results := make(chan result, len(candidates))
 	slots := make(chan struct{}, parallel)
-	started := time.Now()
+	var workers sync.WaitGroup
+	// The site stage must not start while a ping-stage tunnel can still
+	// handshake with the shared key.
+	defer workers.Wait()
+	workers.Add(1)
 	go func() {
+		defer workers.Done()
 		for _, candidate := range candidates {
 			select {
 			case slots <- struct{}{}:
@@ -171,10 +266,12 @@ func Select(ctx context.Context, peer *Peer, cache *EndpointCache, parallel int,
 				results <- result{candidate: candidate, err: roundContext.Err()}
 				continue
 			}
+			workers.Add(1)
 			go func(candidate warpCandidate) {
+				defer workers.Done()
 				defer func() { <-slots }()
 				var rtt time.Duration
-				tunnel, err := openProbe(peer, candidate, fwmark)
+				tunnel, err := openProbe(peer, candidate, opts.Fwmark)
 				if err == nil {
 					rtt, err = tunnel.probe(roundContext)
 				}
@@ -184,35 +281,189 @@ func Select(ctx context.Context, peer *Peer, cache *EndpointCache, parallel int,
 		}
 	}()
 
+	var shortlist []pinged
 	var lastErr error
-	for completed := 0; completed < len(candidates); completed++ {
+	var window <-chan time.Time
+	for completed := 0; completed < len(candidates) && len(shortlist) < shortlistSize; completed++ {
 		select {
 		case outcome := <-results:
 			if outcome.err == nil {
-				cancel()
-				cache.remember(outcome.candidate, outcome.rtt)
-				return Selection{
-					Endpoint: outcome.candidate.endpoint,
-					Profile:  outcome.candidate.profile,
-					Source:   string(outcome.candidate.source),
-					Latency:  time.Since(started),
-					RTT:      outcome.rtt,
-				}, nil
+				shortlist = append(shortlist, pinged{candidate: outcome.candidate, rtt: outcome.rtt})
+				if window == nil {
+					window = time.After(collectWindow)
+				}
+				continue
 			}
 			if roundContext.Err() == nil {
 				lastErr = outcome.err
+				if outcome.candidate.source == sourceCached {
+					cache.fail(outcome.candidate.endpoint)
+				}
 			}
-			if outcome.candidate.source == sourceCached && roundContext.Err() == nil {
-				cache.fail(outcome.candidate.endpoint)
-			}
+		case <-window:
+			completed = len(candidates)
 		case <-ctx.Done():
-			return Selection{}, ctx.Err()
+			return nil, ctx.Err()
 		}
+	}
+	cancel()
+	if len(shortlist) > 0 {
+		return shortlist, nil
 	}
 	if lastErr == nil {
 		lastErr = errors.New("no WARP endpoint answered")
 	}
-	return Selection{}, fmt.Errorf("no working WARP endpoint: %w", lastErr)
+	return nil, fmt.Errorf("no working WARP endpoint: %w", lastErr)
+}
+
+// evaluate opens one candidate again and runs the site stage through it.
+func evaluate(ctx context.Context, peer *Peer, candidate warpCandidate, opts Options, addresses map[string]string) (Selection, error) {
+	tunnel, err := openProbe(peer, candidate, opts.Fwmark)
+	if err != nil {
+		return Selection{}, err
+	}
+	defer tunnel.close()
+	rtt, err := tunnel.probe(ctx)
+	if err != nil {
+		return Selection{}, err
+	}
+	selection := Selection{Endpoint: candidate.endpoint, Profile: candidate.profile, Source: string(candidate.source),
+		RTT: rtt, SitesTotal: len(opts.TestURLs)}
+	client := tunnel.httpClient(addresses)
+	selection.Colo = traceColo(ctx, client)
+	type outcome struct {
+		url string
+		err error
+	}
+	outcomes := make(chan outcome, len(opts.TestURLs))
+	for _, url := range opts.TestURLs {
+		go func(url string) { outcomes <- outcome{url, fetch(ctx, client, url)} }(url)
+	}
+	for range opts.TestURLs {
+		result := <-outcomes
+		if result.err == nil {
+			selection.SitesOK++
+		} else {
+			selection.SiteErrors = append(selection.SiteErrors, result.url+": "+result.err.Error())
+		}
+	}
+	return selection, nil
+}
+
+// betterSelection ranks by test URLs opened, then by an exit outside the
+// avoided locations, then by round trip.
+func betterSelection(a, b Selection, avoid []string) bool {
+	if a.SitesOK != b.SitesOK {
+		return a.SitesOK > b.SitesOK
+	}
+	if avoidA, avoidB := avoided(a.Colo, avoid), avoided(b.Colo, avoid); avoidA != avoidB {
+		return avoidB
+	}
+	return a.RTT < b.RTT
+}
+
+func avoided(colo string, avoid []string) bool {
+	for _, code := range avoid {
+		if strings.EqualFold(code, colo) {
+			return true
+		}
+	}
+	return false
+}
+
+// resolveTestHosts resolves the test hosts once, outside the tunnel: the
+// probe tunnels have no DNS of their own.
+func resolveTestHosts(ctx context.Context, urls []string) map[string]string {
+	addresses := map[string]string{}
+	for _, raw := range urls {
+		parsed, err := url.Parse(raw)
+		if err != nil || parsed.Hostname() == "" {
+			continue
+		}
+		host := parsed.Hostname()
+		if _, done := addresses[host]; done || net.ParseIP(host) != nil {
+			continue
+		}
+		resolveContext, cancel := context.WithTimeout(ctx, 5*time.Second)
+		found, err := net.DefaultResolver.LookupNetIP(resolveContext, "ip4", host)
+		cancel()
+		if err == nil && len(found) > 0 {
+			addresses[host] = found[0].String()
+		}
+	}
+	return addresses
+}
+
+// httpClient fetches through the probe tunnel, dialing resolved addresses.
+func (t *probeTunnel) httpClient(addresses map[string]string) *http.Client {
+	return &http.Client{
+		Timeout: siteTimeout,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+		Transport: &http.Transport{
+			DisableKeepAlives: true,
+			DialContext: func(ctx context.Context, _, address string) (net.Conn, error) {
+				host, port, err := net.SplitHostPort(address)
+				if err != nil {
+					return nil, err
+				}
+				if resolved, ok := addresses[host]; ok {
+					host = resolved
+				}
+				target, err := net.ResolveTCPAddr("tcp", net.JoinHostPort(host, port))
+				if err != nil {
+					return nil, err
+				}
+				return t.net.DialContextTCP(ctx, target)
+			},
+		},
+	}
+}
+
+func traceColo(ctx context.Context, client *http.Client) string {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, traceURL, nil)
+	if err != nil {
+		return ""
+	}
+	response, err := client.Do(request)
+	if err != nil {
+		return ""
+	}
+	defer response.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
+	for _, line := range strings.Split(string(body), "\n") {
+		if colo, ok := strings.CutPrefix(line, "colo="); ok {
+			return strings.TrimSpace(colo)
+		}
+	}
+	return ""
+}
+
+func fetch(ctx context.Context, client *http.Client, target string) error {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+	if err != nil {
+		return err
+	}
+	request.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36")
+	response, err := client.Do(request)
+	if err != nil {
+		return shortError(err)
+	}
+	defer response.Body.Close()
+	read, err := io.CopyN(io.Discard, response.Body, siteEnoughBytes)
+	if err == nil || errors.Is(err, io.EOF) {
+		return nil
+	}
+	return fmt.Errorf("stalled after %d bytes", read)
+}
+
+func shortError(err error) error {
+	message := err.Error()
+	if len(message) > 120 {
+		message = message[:120] + "..."
+	}
+	return errors.New(message)
 }
 
 // Forget evicts an endpoint that stopped passing traffic.
