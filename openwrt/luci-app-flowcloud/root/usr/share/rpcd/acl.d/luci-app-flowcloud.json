@@ -1,0 +1,15 @@
+{
+	"luci-app-flowcloud": {
+		"description": "Grant UCI and status access to LuCI app FlowCloud",
+		"read": {
+			"file": {
+				"/usr/bin/flowcloudd": [ "exec" ],
+				"/etc/init.d/flowcloud": [ "exec" ]
+			},
+			"uci": [ "flowcloud", "network" ]
+		},
+		"write": {
+			"uci": [ "flowcloud" ]
+		}
+	}
+}

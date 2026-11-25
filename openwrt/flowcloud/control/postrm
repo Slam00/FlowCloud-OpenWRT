@@ -1,0 +1,5 @@
+#!/bin/sh
+[ -n "${IPKG_INSTROOT}" ] && exit 0
+# The fw4 include files are gone: reload the firewall without them.
+fw4 -q reload 2>/dev/null
+exit 0

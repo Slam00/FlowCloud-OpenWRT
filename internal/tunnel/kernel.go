@@ -1,0 +1,114 @@
+// Package tunnel drives the kernel AmneziaWG interface of a WARP tunnel and
+// checks that tunnels pass traffic.
+package tunnel
+
+import (
+	"context"
+	"fmt"
+	"strings"
+	"time"
+
+	"flowcloud-openwrt/internal/netx"
+	"flowcloud-openwrt/internal/system"
+	"flowcloud-openwrt/internal/warp"
+)
+
+// MTU fits WARP over mobile and PPPoE uplinks.
+const MTU = 1280
+
+// Kernel is a WARP tunnel carried by kmod-amneziawg.
+type Kernel struct {
+	Device  string
+	KeyFile string
+}
+
+// Supported reports whether the kernel can create AmneziaWG interfaces.
+func Supported() bool {
+	_, err := system.Run("awg", "--version")
+	if err != nil {
+		return false
+	}
+	probe := "fcprobe0"
+	if _, err := system.Run("ip", "link", "add", "dev", probe, "type", "amneziawg"); err != nil {
+		return false
+	}
+	_, _ = system.Run("ip", "link", "del", "dev", probe)
+	return true
+}
+
+// Ensure creates and configures the device for the account. The device
+// marks its encrypted packets as direct so they never re-enter a tunnel.
+func (k *Kernel) Ensure(peer *warp.Peer) error {
+	if !system.LinkExists(k.Device) {
+		if _, err := system.Run("ip", "link", "add", "dev", k.Device, "type", "amneziawg"); err != nil {
+			return err
+		}
+	}
+	if _, err := system.Run("ip", "link", "set", "dev", k.Device, "mtu", fmt.Sprint(MTU)); err != nil {
+		return err
+	}
+	if _, err := system.Run("ip", "address", "replace", peer.AddressV4.String()+"/32", "dev", k.Device); err != nil {
+		return err
+	}
+	if _, err := system.Run("awg", "set", k.Device, "private-key", k.KeyFile, "fwmark", fmt.Sprintf("0x%x", netx.MarkDirect)); err != nil {
+		return err
+	}
+	_, err := system.Run("ip", "link", "set", "dev", k.Device, "up")
+	return err
+}
+
+// Apply switches the device to the selected endpoint and profile without
+// taking it down.
+func (k *Kernel) Apply(peer *warp.Peer, selection warp.Selection, publicKey string) error {
+	args := []string{"set", k.Device}
+	args = append(args, selection.Profile.AWGArgs()...)
+	args = append(args, "peer", publicKey, "endpoint", selection.Endpoint,
+		"allowed-ips", "0.0.0.0/0", "persistent-keepalive", "25")
+	_, err := system.Run("awg", args...)
+	return err
+}
+
+// Remove deletes the device.
+func (k *Kernel) Remove() {
+	if system.LinkExists(k.Device) {
+		_, _ = system.Run("ip", "link", "del", "dev", k.Device)
+	}
+}
+
+// Endpoints returns the peer endpoints of a WireGuard/AmneziaWG device, so
+// they can bypass routing. Other devices return nothing.
+func Endpoints(device string) []string {
+	var output string
+	var err error
+	for _, tool := range []string{"awg", "wg"} {
+		output, err = system.Run(tool, "show", device, "endpoints")
+		if err == nil {
+			break
+		}
+	}
+	if err != nil {
+		return nil
+	}
+	var endpoints []string
+	for _, line := range strings.Split(output, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 2 && fields[1] != "(none)" {
+			endpoints = append(endpoints, fields[1])
+		}
+	}
+	return endpoints
+}
+
+// Ping measures a TCP handshake to the probe target through the tunnel with
+// this mark: it proves data flows both ways, not just the WireGuard handshake.
+func Ping(ctx context.Context, mark uint32, timeout time.Duration) (time.Duration, error) {
+	dialer := netx.MarkedDialer(mark, timeout)
+	started := time.Now()
+	connection, err := dialer.DialContext(ctx, "tcp4", warp.ProbeTarget)
+	if err != nil {
+		return 0, err
+	}
+	elapsed := time.Since(started)
+	_ = connection.Close()
+	return elapsed, nil
+}

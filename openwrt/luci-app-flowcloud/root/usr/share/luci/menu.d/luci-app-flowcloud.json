@@ -1,0 +1,14 @@
+{
+	"admin/services/flowcloud": {
+		"title": "FlowCloud",
+		"order": 41,
+		"action": {
+			"type": "view",
+			"path": "flowcloud/flowcloud"
+		},
+		"depends": {
+			"acl": [ "luci-app-flowcloud" ],
+			"uci": { "flowcloud": true }
+		}
+	}
+}

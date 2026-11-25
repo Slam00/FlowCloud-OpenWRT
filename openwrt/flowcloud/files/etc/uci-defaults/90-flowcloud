@@ -1,0 +1,4 @@
+#!/bin/sh
+# Load the fw4 includes that forward and masquerade tunnelled traffic.
+fw4 -q reload 2>/dev/null
+exit 0

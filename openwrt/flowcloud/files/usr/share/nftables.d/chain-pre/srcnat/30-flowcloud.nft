@@ -1,0 +1,2 @@
+# FlowCloud: masquerade traffic leaving through a FlowCloud tunnel.
+meta mark & 0x0f000000 != 0x00000000 meta mark & 0x0f000000 != 0x0e000000 counter masquerade comment "FlowCloud: tunnelled traffic"

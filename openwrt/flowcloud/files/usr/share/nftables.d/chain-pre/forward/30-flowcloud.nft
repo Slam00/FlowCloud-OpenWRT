@@ -1,0 +1,2 @@
+# FlowCloud: forward LAN traffic the flowcloud table marked for a tunnel.
+meta mark & 0x0f000000 != 0x00000000 meta mark & 0x0f000000 != 0x0e000000 counter accept comment "FlowCloud: tunnelled traffic"
