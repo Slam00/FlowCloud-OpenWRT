@@ -35,6 +35,34 @@ fetch() {
 	fi
 }
 
+# fetch_binary downloads a release asset through the GitHub API.
+fetch_binary() {
+	if command -v curl >/dev/null 2>&1; then
+		curl -fsSL -H "Accept: application/octet-stream" -o "$2" "$1"
+	else
+		wget -q --header "Accept: application/octet-stream" -O "$2" "$1"
+	fi
+}
+
+# fetch_asset REPO TAG NAME DEST downloads a release asset (TAG "latest" or
+# a tag name). Some networks filter github.com for the TLS client of
+# OpenWrt's wget while api.github.com passes, so the API comes first and the
+# usual download link second.
+fetch_asset() {
+	case "$2" in
+	latest) API_PATH=latest; LINK="https://github.com/$1/releases/latest/download/$3" ;;
+	*) API_PATH="tags/$2"; LINK="https://github.com/$1/releases/download/$2/$3" ;;
+	esac
+	JSON="$TMP/release-$(echo "$1-$2" | tr '/' '_').json"
+	if [ -s "$JSON" ] || fetch "https://api.github.com/repos/$1/releases/$API_PATH" "$JSON"; then
+		ASSET=$(jsonfilter -i "$JSON" -e "@.assets[@.name=\"$3\"].url" 2>/dev/null || true)
+		if [ -n "$ASSET" ] && fetch_binary "$ASSET" "$4"; then
+			return 0
+		fi
+	fi
+	fetch "$LINK" "$4"
+}
+
 # The package architecture with the highest priority, e.g. aarch64_cortex-a53.
 ARCH=$(opkg print-architecture | awk '$2 != "all" && $2 != "noarch" {print $3, $2}' | sort -n | tail -1 | cut -d' ' -f2)
 [ -n "$ARCH" ] || die "не удалось определить архитектуру пакетов"
@@ -56,9 +84,8 @@ if ! ip link add dev fcprobe0 type amneziawg 2>/dev/null; then
 	y|Y|yes|д|Д|да)
 		SUFFIX="v${VERSION}_${ARCH}_$(echo "$TARGET" | tr '/' '_')"
 		for PKG in kmod-amneziawg amneziawg-tools; do
-			URL="https://github.com/$AWG_REPO/releases/download/v${VERSION}/${PKG}_${SUFFIX}.ipk"
-			echo "Скачиваю $URL"
-			fetch "$URL" "$TMP/$PKG.ipk" || die "нет пакета $PKG для OpenWrt $VERSION ($TARGET). WARP-туннели работать не будут, но интерфейсные — будут."
+			echo "Скачиваю ${PKG}_${SUFFIX}.ipk из $AWG_REPO"
+			fetch_asset "$AWG_REPO" "v${VERSION}" "${PKG}_${SUFFIX}.ipk" "$TMP/$PKG.ipk" || die "нет пакета $PKG для OpenWrt $VERSION ($TARGET). WARP-туннели работать не будут, но интерфейсные — будут."
 		done
 		opkg install "$TMP/kmod-amneziawg.ipk" "$TMP/amneziawg-tools.ipk"
 		;;
@@ -70,11 +97,16 @@ else
 	ip link del dev fcprobe0
 fi
 
-BASE="https://github.com/$REPO/releases/latest/download"
 echo
 echo "Скачиваю FlowCloud для $ARCH"
-fetch "$BASE/flowcloud_${ARCH}.ipk" "$TMP/flowcloud.ipk" || die "нет сборки FlowCloud для $ARCH"
-fetch "$BASE/luci-app-flowcloud_all.ipk" "$TMP/luci-app-flowcloud.ipk"
+fetch_asset "$REPO" latest "flowcloud_${ARCH}.ipk" "$TMP/flowcloud.ipk" || die "нет сборки FlowCloud для $ARCH"
+fetch_asset "$REPO" latest "luci-app-flowcloud_all.ipk" "$TMP/luci-app-flowcloud.ipk" || die "не удалось скачать luci-app-flowcloud"
+fetch_asset "$REPO" latest SHA256SUMS "$TMP/SHA256SUMS" || die "не удалось скачать контрольные суммы FlowCloud"
+for PKG in "flowcloud_${ARCH}.ipk:flowcloud.ipk" "luci-app-flowcloud_all.ipk:luci-app-flowcloud.ipk"; do
+	EXPECTED=$(grep " \*${PKG%%:*}\$" "$TMP/SHA256SUMS" | cut -d' ' -f1)
+	ACTUAL=$(sha256sum "$TMP/${PKG#*:}" | cut -d' ' -f1)
+	[ -n "$EXPECTED" ] && [ "$EXPECTED" = "$ACTUAL" ] || die "контрольная сумма ${PKG%%:*} не совпала"
+done
 opkg install "$TMP/flowcloud.ipk" "$TMP/luci-app-flowcloud.ipk"
 
 install_zapret2() {
@@ -90,10 +122,9 @@ install_zapret2() {
 	*) echo "zapret2: нет сборки для $ARCH, пропускаю."; return 0 ;;
 	esac
 	NAME="zapret2-v${ZAPRET2_VERSION}"
-	BASE="https://github.com/bol-van/zapret2/releases/download/v${ZAPRET2_VERSION}"
 	echo "Скачиваю zapret2 ${ZAPRET2_VERSION} ($ZARCH)"
-	fetch "$BASE/${NAME}-openwrt-embedded.tar.gz" "$TMP/zapret2.tar.gz" || die "не удалось скачать zapret2"
-	fetch "$BASE/sha256sum.txt" "$TMP/zapret2.sha256" || die "не удалось скачать контрольные суммы zapret2"
+	fetch_asset bol-van/zapret2 "v${ZAPRET2_VERSION}" "${NAME}-openwrt-embedded.tar.gz" "$TMP/zapret2.tar.gz" || die "не удалось скачать zapret2"
+	fetch_asset bol-van/zapret2 "v${ZAPRET2_VERSION}" sha256sum.txt "$TMP/zapret2.sha256" || die "не удалось скачать контрольные суммы zapret2"
 	tar -xzf "$TMP/zapret2.tar.gz" -C "$TMP" "$NAME/binaries/$ZARCH/nfqws2" \
 		"$NAME/lua/zapret-lib.lua.gz" "$NAME/lua/zapret-antidpi.lua.gz" "$NAME/lua/zapret-auto.lua.gz"
 	EXPECTED=$(grep " $NAME/binaries/$ZARCH/nfqws2\$" "$TMP/zapret2.sha256" | cut -d' ' -f1)
