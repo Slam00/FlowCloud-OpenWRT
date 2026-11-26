@@ -70,6 +70,37 @@ func removeWarpDevice(device string) {
 	(&tunnel.Kernel{Device: device}).Remove()
 }
 
+// adoptWarp takes over a device the previous run kept (a reload or a
+// restart) when its endpoint is a known pair and traffic still flows
+// through it: no selection, no new session.
+func (d *Daemon) adoptWarp(ctx context.Context, t *config.Tunnel, mark uint32, cache *warp.EndpointCache) (warp.Selection, bool) {
+	endpoints := tunnel.Endpoints(t.Device)
+	if len(endpoints) != 1 {
+		return warp.Selection{}, false
+	}
+	var selection warp.Selection
+	found := false
+	for _, entry := range cache.Snapshot() {
+		if entry.Endpoint == endpoints[0] {
+			selection = warp.Selection{Endpoint: entry.Endpoint, Profile: entry.Profile, Source: "kept", Colo: entry.Colo}
+			found = true
+			break
+		}
+	}
+	if !found {
+		return warp.Selection{}, false
+	}
+	d.setBypass(t.Name, endpointPrefixes([]string{selection.Endpoint}))
+	if route.SetDevice(t.Index, t.Device, t.FailClosed) != nil {
+		return warp.Selection{}, false
+	}
+	if _, err := tunnel.Ping(ctx, mark, pingTimeout); err != nil {
+		log.Printf("tunnel %s: the kept session through %s carries no traffic; selecting", t.Name, selection.Endpoint)
+		return warp.Selection{}, false
+	}
+	return selection, true
+}
+
 func sleep(ctx context.Context, delay time.Duration) bool {
 	timer := time.NewTimer(delay)
 	defer timer.Stop()
@@ -224,9 +255,14 @@ func (d *Daemon) runWarp(ctx context.Context, t *config.Tunnel) {
 		case selection.SitesTotal > 0:
 			sites = fmt.Sprintf(", test sites %d/%d", selection.SitesOK, selection.SitesTotal)
 		}
-		log.Printf("tunnel %s: endpoint %s [%s %s] exit %s selected in %s, %s through it%s%s", t.Name, selection.Endpoint,
-			selection.Source, selection.Profile.Name, orDash(selection.Colo), selection.Latency.Round(time.Millisecond),
-			selection.RTT.Round(time.Millisecond), sites, reason)
+		if selection.Source == "kept" {
+			log.Printf("tunnel %s: keeping endpoint %s [%s] exit %s from the previous run", t.Name, selection.Endpoint,
+				selection.Profile.Name, orDash(selection.Colo))
+		} else {
+			log.Printf("tunnel %s: endpoint %s [%s %s] exit %s selected in %s, %s through it%s%s", t.Name, selection.Endpoint,
+				selection.Source, selection.Profile.Name, orDash(selection.Colo), selection.Latency.Round(time.Millisecond),
+				selection.RTT.Round(time.Millisecond), sites, reason)
+		}
 		d.board.tunnel(t.Name, func(status *TunnelStatus) {
 			status.State = "up"
 			status.Endpoint = selection.Endpoint
@@ -286,11 +322,21 @@ func (d *Daemon) runWarp(ctx context.Context, t *config.Tunnel) {
 	var lastQualityCheck time.Time
 	// reconnects counts flows revived from a new source port.
 	reconnects := 0
+	adopted, kept := d.adoptWarp(ctx, t, mark, cache)
+	if kept {
+		announce(adopted, "")
+	}
 	for ctx.Err() == nil {
-		d.board.tunnel(t.Name, func(status *TunnelStatus) { status.State = "selecting"; status.Error = "" })
-		selection, err := selectBest("")
-		if err == nil {
-			selection, _, err = connect(selection, "", nil)
+		var selection warp.Selection
+		var err error
+		if kept {
+			selection, kept = adopted, false
+		} else {
+			d.board.tunnel(t.Name, func(status *TunnelStatus) { status.State = "selecting"; status.Error = "" })
+			selection, err = selectBest("")
+			if err == nil {
+				selection, _, err = connect(selection, "", nil)
+			}
 		}
 		if err != nil {
 			if ctx.Err() != nil {

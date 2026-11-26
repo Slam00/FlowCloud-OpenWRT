@@ -140,6 +140,7 @@ func (d *Daemon) runOnce(ctx context.Context, updateLists <-chan struct{}) error
 	if err != nil {
 		return fmt.Errorf("configuration: %w", err)
 	}
+	d.dropStaleWarpDevices(cfg)
 	d.board.update(func(status *Status) {
 		*status = Status{Version: d.opts.Version, StartedAt: status.StartedAt}
 		status.DNS.Listen = cfg.Settings.DNSListen
@@ -229,6 +230,9 @@ func (d *Daemon) runOnce(ctx context.Context, updateLists <-chan struct{}) error
 	var wait sync.WaitGroup
 	for _, tunnel := range cfg.Tunnels {
 		if !tunnel.Enabled {
+			if tunnel.Type == config.TunnelWarp {
+				removeWarpDevice(tunnel.Device)
+			}
 			continue
 		}
 		if !used[tunnel.Name] {
@@ -298,10 +302,25 @@ func (d *Daemon) shutdown(final bool) {
 	_ = nft.Delete()
 	route.Cleanup(config.MaxTunnels)
 	if cfg != nil {
+		// A reload or a restart keeps the WARP devices with their sessions:
+		// the next run adopts a device that still carries traffic instead of
+		// selecting again, which on some networks costs tens of seconds
+		// before a fresh flow passes data.
+		_, restartErr := os.Stat(d.restartFlag())
+		keep := !final || restartErr == nil
+		var kept []string
 		for _, tunnel := range cfg.Tunnels {
-			if tunnel.Type == config.TunnelWarp {
-				removeWarpDevice(tunnel.Device)
+			if tunnel.Type != config.TunnelWarp {
+				continue
 			}
+			if keep && tunnel.Enabled && system.LinkExists(tunnel.Device) {
+				kept = append(kept, tunnel.Device)
+				continue
+			}
+			removeWarpDevice(tunnel.Device)
+		}
+		if len(kept) > 0 {
+			_ = os.WriteFile(d.keptDevicesPath(), []byte(strings.Join(kept, "\n")+"\n"), 0o644)
 		}
 		_, restarting := os.Stat(d.restartFlag())
 		if final && cfg.Settings.DnsmasqIntegration && restarting != nil {
@@ -573,6 +592,30 @@ func endpointPrefixes(endpoints []string) []netip.Prefix {
 var errStopped = errors.New("stopped")
 
 func (d *Daemon) restartFlag() string { return filepath.Join(d.opts.RunDir, "restarting") }
+
+// keptDevicesPath lists the WARP devices the previous run left up.
+func (d *Daemon) keptDevicesPath() string { return filepath.Join(d.opts.RunDir, "warp-kept") }
+
+// dropStaleWarpDevices removes devices the previous run kept that no
+// enabled WARP tunnel of cfg uses (a tunnel removed, renamed or disabled).
+func (d *Daemon) dropStaleWarpDevices(cfg *config.Config) {
+	data, err := os.ReadFile(d.keptDevicesPath())
+	_ = os.Remove(d.keptDevicesPath())
+	if err != nil {
+		return
+	}
+	wanted := map[string]bool{}
+	for _, tunnel := range cfg.Tunnels {
+		if tunnel.Type == config.TunnelWarp && tunnel.Enabled && cfg.Settings.Enabled {
+			wanted[tunnel.Device] = true
+		}
+	}
+	for _, device := range strings.Fields(string(data)) {
+		if !wanted[device] {
+			removeWarpDevice(device)
+		}
+	}
+}
 
 func (d *Daemon) learnedPath() string { return filepath.Join(d.opts.RunDir, "learned.json") }
 
