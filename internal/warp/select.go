@@ -161,6 +161,20 @@ func (t *probeTunnel) probe(ctx context.Context) (time.Duration, error) {
 		return 0, err
 	}
 	first := time.Since(started)
+	// A handshake alone is not proof that data flows: the edge must answer.
+	plain, err := net.ResolveTCPAddr("tcp", "1.1.1.1:80")
+	if err == nil {
+		var check net.Conn
+		check, err = t.net.DialContextTCP(probeContext, plain)
+		if err == nil {
+			err = expectHTTP(probeContext, check)
+			check.Close()
+		}
+	}
+	if err != nil {
+		_ = connection.Close()
+		return 0, fmt.Errorf("no data through the endpoint: %w", err)
+	}
 	_ = connection.Close()
 	started = time.Now()
 	connection, err = t.net.DialContextTCP(probeContext, address)
@@ -175,6 +189,24 @@ func (t *probeTunnel) probe(ctx context.Context) (time.Duration, error) {
 type pinged struct {
 	candidate warpCandidate
 	rtt       time.Duration
+}
+
+// expectHTTP sends a HEAD and waits for the start of the response.
+func expectHTTP(ctx context.Context, connection net.Conn) error {
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = connection.SetDeadline(deadline)
+	}
+	if _, err := io.WriteString(connection, "HEAD / HTTP/1.1\r\nHost: 1.1.1.1\r\nConnection: close\r\n\r\n"); err != nil {
+		return err
+	}
+	reply := make([]byte, 8)
+	if _, err := io.ReadFull(connection, reply); err != nil {
+		return err
+	}
+	if !strings.HasPrefix(string(reply), "HTTP/1.") {
+		return errors.New("unexpected reply")
+	}
+	return nil
 }
 
 // Select runs one selection round in two stages. The ping stage tests up to

@@ -4,7 +4,9 @@ package tunnel
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"time"
 
@@ -109,16 +111,42 @@ func Endpoints(device string) []string {
 	return endpoints
 }
 
-// Ping measures a TCP handshake to the probe target through the tunnel with
-// this mark: it proves data flows both ways, not just the WireGuard handshake.
+// pingTarget answers a plain HTTP request from the same Cloudflare edge as
+// the WARP endpoint.
+const pingTarget = "1.1.1.1:80"
+
+// pingRequest is a HEAD the edge answers with a redirect of a few hundred
+// bytes.
+const pingRequest = "HEAD / HTTP/1.1\r\nHost: 1.1.1.1\r\nUser-Agent: flowcloud\r\nConnection: close\r\n\r\n"
+
+// Ping checks the tunnel with this mark and returns the round trip of its
+// TCP handshake. A handshake alone is not proof: a WARP endpoint has been
+// seen completing TCP handshakes while no reply with data came back (found
+// by WindseekerTunnel), so Ping also sends a request and waits for the
+// start of the response.
 func Ping(ctx context.Context, mark uint32, timeout time.Duration) (time.Duration, error) {
+	pingContext, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
 	dialer := netx.MarkedDialer(mark, timeout)
 	started := time.Now()
-	connection, err := dialer.DialContext(ctx, "tcp4", warp.ProbeTarget)
+	connection, err := dialer.DialContext(pingContext, "tcp4", pingTarget)
 	if err != nil {
 		return 0, err
 	}
+	defer connection.Close()
 	elapsed := time.Since(started)
-	_ = connection.Close()
+	if deadline, ok := pingContext.Deadline(); ok {
+		_ = connection.SetDeadline(deadline)
+	}
+	if _, err := io.WriteString(connection, pingRequest); err != nil {
+		return 0, fmt.Errorf("send through tunnel: %w", err)
+	}
+	reply := make([]byte, 8)
+	if _, err := io.ReadFull(connection, reply); err != nil {
+		return 0, fmt.Errorf("no data through tunnel: %w", err)
+	}
+	if !strings.HasPrefix(string(reply), "HTTP/1.") {
+		return 0, errors.New("unexpected reply through tunnel")
+	}
 	return elapsed, nil
 }
