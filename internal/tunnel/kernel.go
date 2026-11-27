@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	mrand "math/rand"
 	"strings"
 	"time"
@@ -26,6 +27,9 @@ type Kernel struct {
 	// AWG3 applies the AmneziaWG 3 client parameters (warp/awg3.go); off, it
 	// resets them on a device that had them.
 	AWG3 bool
+	// noAWG3 is set once awg refused the AmneziaWG 3 arguments (tools and
+	// module before 3.x).
+	noAWG3 bool
 }
 
 // Supported reports whether the kernel can create AmneziaWG interfaces.
@@ -76,13 +80,34 @@ func (k *Kernel) Ensure(peer *warp.Peer) error {
 // on its long-lived port fails.
 func (k *Kernel) Apply(peer *warp.Peer, selection warp.Selection, publicKey string) error {
 	_, _ = system.Run("awg", "set", k.Device, "peer", publicKey, "remove")
-	args := []string{"set", k.Device, "listen-port", "0"}
-	args = append(args, selection.Profile.AWGArgs()...)
-	args = append(args, warp.AWG3Args(k.AWG3, mrand.New(mrand.NewSource(time.Now().UnixNano())))...)
-	args = append(args, "peer", publicKey, "endpoint", selection.Endpoint,
-		"allowed-ips", "0.0.0.0/0", "persistent-keepalive", warp.Keepalive(k.AWG3))
-	_, err := system.Run("awg", args...)
-	return err
+	// withAWG3 adds the AmneziaWG 3 arguments: the parameters when enabled,
+	// else the values that reset them. Tools that predate AmneziaWG 3 know
+	// neither, so after one refusal they are left out altogether.
+	build := func(withAWG3 bool) []string {
+		args := []string{"set", k.Device, "listen-port", "0"}
+		args = append(args, selection.Profile.AWGArgs()...)
+		keepalive := warp.Keepalive(false)
+		if withAWG3 {
+			args = append(args, warp.AWG3Args(k.AWG3, mrand.New(mrand.NewSource(time.Now().UnixNano())))...)
+			keepalive = warp.Keepalive(k.AWG3)
+		}
+		return append(args, "peer", publicKey, "endpoint", selection.Endpoint,
+			"allowed-ips", "0.0.0.0/0", "persistent-keepalive", keepalive)
+	}
+	if k.noAWG3 {
+		_, err := system.Run("awg", build(false)...)
+		return err
+	}
+	_, err := system.Run("awg", build(true)...)
+	if err == nil {
+		return nil
+	}
+	if _, plainErr := system.Run("awg", build(false)...); plainErr != nil {
+		return err
+	}
+	k.noAWG3 = true
+	log.Printf("tunnel %s: awg does not take the AmneziaWG 3 parameters (%v); the tunnel runs without them. Update kmod-amneziawg and amneziawg-tools to 3.x to use them", k.Device, err)
+	return nil
 }
 
 // Remove deletes the device.
