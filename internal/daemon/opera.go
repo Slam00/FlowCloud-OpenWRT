@@ -7,14 +7,108 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net/netip"
 	"strings"
+	"sync"
 	"time"
 
 	"flowcloud-openwrt/internal/config"
+	"flowcloud-openwrt/internal/dnsproxy"
 	"flowcloud-openwrt/internal/netx"
 	"flowcloud-openwrt/internal/nft"
 	"flowcloud-openwrt/internal/opera"
 )
+
+// operaSection reports whether section goes through an Opera tunnel; the
+// caller holds d.mutex.
+func (d *Daemon) operaSection(section *config.Section) bool {
+	if section.Action != config.ActionTunnel {
+		return false
+	}
+	tunnel := d.cfg.Tunnel(section.Tunnel)
+	return tunnel != nil && tunnel.Type == config.TunnelOpera
+}
+
+// routing is a snapshot of the active sections in their configured order.
+type routing struct {
+	matcher  *dnsproxy.Matcher
+	sections []routedSection
+}
+
+type routedSection struct {
+	name    string
+	mark    uint32
+	block   bool
+	opera   string // the Opera tunnel of the section, if any
+	subnets []netip.Prefix
+}
+
+func (s routedSection) route(tunnel string) opera.Route {
+	switch {
+	case s.opera == tunnel:
+		return opera.Route{Opera: true}
+	case s.block:
+		return opera.Route{Block: true}
+	case s.opera != "":
+		// Another Opera tunnel: its redirect comes first, so this one only
+		// sees the connection when that tunnel is off. Leave it direct.
+		return opera.Route{Mark: netx.MarkDirect}
+	}
+	return opera.Route{Mark: s.mark}
+}
+
+func (s routedSection) contains(ip netip.Addr) bool {
+	for _, prefix := range s.subnets {
+		if prefix.Contains(ip) {
+			return true
+		}
+	}
+	return nft.Contains(nft.DNSSet(s.name), ip)
+}
+
+// operaRoute decides where a connection redirected to the Opera tunnel goes.
+// A host some section lists goes that section's way, as DNS would have
+// routed it. An unlisted host goes the way of the first other section that
+// holds the address, and through Opera when none does; so does a connection
+// without a host name.
+func (d *Daemon) operaRoute(tunnel string) func(string, netip.Addr) opera.Route {
+	type cached struct {
+		route   opera.Route
+		expires time.Time
+	}
+	var mutex sync.Mutex
+	cache := map[netip.Addr]cached{}
+	return func(host string, ip netip.Addr) opera.Route {
+		state := d.routing.Load()
+		if state == nil || host == "" {
+			return opera.Route{Opera: true}
+		}
+		if index, ok := state.matcher.Match(host); ok {
+			return state.sections[index].route(tunnel)
+		}
+		now := time.Now()
+		mutex.Lock()
+		entry, ok := cache[ip]
+		mutex.Unlock()
+		if ok && now.Before(entry.expires) {
+			return entry.route
+		}
+		route := opera.Route{Opera: true}
+		for _, section := range state.sections {
+			if section.opera == "" && section.contains(ip) {
+				route = section.route(tunnel)
+				break
+			}
+		}
+		mutex.Lock()
+		if len(cache) > 4096 {
+			clear(cache)
+		}
+		cache[ip] = cached{route: route, expires: now.Add(time.Minute)}
+		mutex.Unlock()
+		return route
+	}
+}
 
 // operaRedirects lists the Opera tunnels of active sections for the
 // ruleset; the caller holds d.mutex. Their sections' TCP always goes to the
@@ -48,7 +142,7 @@ func (d *Daemon) runOpera(ctx context.Context, t *config.Tunnel) {
 		return
 	}
 	client := &opera.Client{Country: t.Country, Mark: netx.TunnelMark(via.Index)}
-	proxy := &opera.Transparent{Port: config.OperaPortBase + t.Index, Client: client, Name: t.Name}
+	proxy := &opera.Transparent{Port: config.OperaPortBase + t.Index, Client: client, Name: t.Name, Route: d.operaRoute(t.Name)}
 	go func() {
 		if err := proxy.Serve(ctx); err != nil {
 			log.Printf("tunnel %s: transparent proxy: %v", t.Name, err)

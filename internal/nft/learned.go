@@ -10,6 +10,11 @@ import (
 	"time"
 )
 
+// Contains reports whether a set of the table holds ip.
+func Contains(set string, ip netip.Addr) bool {
+	return exec.Command("nft", "get", "element", "inet", Table, set, "{ "+ip.String()+" }").Run() == nil
+}
+
 // Dump returns the elements of the given timeout sets with their remaining
 // lifetime, so learned addresses survive a reload or restart of the daemon.
 func Dump(sets []string) ([]Element, error) {

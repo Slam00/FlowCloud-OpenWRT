@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"flowcloud-openwrt/internal/config"
@@ -58,6 +59,8 @@ type Daemon struct {
 	recent *dnsproxy.Recent
 	// switches holds a channel per running WARP tunnel for manual switches.
 	switches map[string]chan struct{}
+	// routing is what the Opera proxies route by, set with the DNS state.
+	routing atomic.Pointer[routing]
 }
 
 func New(opts Options) *Daemon {
@@ -414,14 +417,23 @@ func (d *Daemon) ruleset() nft.Ruleset {
 		ZapretQueue:      d.zapretQueue(),
 		Redirects:        d.operaRedirects(),
 	}
-	for _, section := range d.activeSections() {
-		mark, block := d.sectionMark(section)
-		ruleset.Rules = append(ruleset.Rules, nft.Rule{
-			Section: section.Name,
-			Mark:    mark,
-			Block:   block,
-			Subnets: d.resolved[section.Name].Subnets,
-		})
+	// Opera sections come first: their sites share addresses with other
+	// Google services, and the Opera proxy sends the connections that are
+	// not its own on by host name (operaRoute).
+	sections := d.activeSections()
+	for _, opera := range []bool{true, false} {
+		for _, section := range sections {
+			if d.operaSection(section) != opera {
+				continue
+			}
+			mark, block := d.sectionMark(section)
+			ruleset.Rules = append(ruleset.Rules, nft.Rule{
+				Section: section.Name,
+				Mark:    mark,
+				Block:   block,
+				Subnets: d.resolved[section.Name].Subnets,
+			})
+		}
 	}
 	return ruleset
 }
@@ -431,11 +443,20 @@ func (d *Daemon) dnsState() *dnsproxy.State {
 	defer d.mutex.Unlock()
 	var domains [][]string
 	var routes []dnsproxy.Route
+	snapshot := &routing{}
 	for _, section := range d.activeSections() {
 		domains = append(domains, d.resolved[section.Name].Domains)
 		routes = append(routes, dnsproxy.Route{Section: section.Name, Watch: section.Action == config.ActionZapret})
+		mark, block := d.sectionMark(section)
+		entry := routedSection{name: section.Name, mark: mark, block: block, subnets: d.resolved[section.Name].Subnets}
+		if d.operaSection(section) {
+			entry.opera = section.Tunnel
+		}
+		snapshot.sections = append(snapshot.sections, entry)
 	}
-	return &dnsproxy.State{Matcher: dnsproxy.NewMatcher(domains), Routes: routes}
+	snapshot.matcher = dnsproxy.NewMatcher(domains)
+	d.routing.Store(snapshot)
+	return &dnsproxy.State{Matcher: snapshot.matcher, Routes: routes}
 }
 
 // applySubnets reloads the static subnet sets without touching learned IPs.

@@ -41,6 +41,15 @@ const (
 	CheckTarget = "1.1.1.1:443"
 )
 
+// Route is where the transparent proxy sends one connection: through Opera,
+// or, for a site that is not the tunnel's own, the way it would have gone
+// without the tunnel (Mark: a tunnel, zapret2 or direct), or nowhere.
+type Route struct {
+	Opera bool
+	Mark  uint32
+	Block bool
+}
+
 // Client keeps a session with Opera's proxy service.
 type Client struct {
 	// Country is EU, AM or AS.

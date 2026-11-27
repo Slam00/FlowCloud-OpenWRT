@@ -15,16 +15,23 @@ import (
 	"syscall"
 	"time"
 	"unsafe"
+
+	"flowcloud-openwrt/internal/netx"
 )
 
 // Transparent accepts the TCP connections nftables redirects to Port and
 // opens each original destination through the Opera proxy. The destination
 // goes by host name when the first bytes carry one (TLS SNI or an HTTP Host
 // header), so Opera resolves it near its exit; else by address.
+//
+// Google serves many sites from the same addresses, so the redirect also
+// catches sites of other sections. Route, given the sniffed host ("" when
+// there is none), sends those their own way.
 type Transparent struct {
 	Port   int
 	Client *Client
 	Name   string
+	Route  func(host string, ip netip.Addr) Route
 
 	active sync.WaitGroup
 }
@@ -77,11 +84,25 @@ func (t *Transparent) handle(ctx context.Context, client *net.TCPConn) {
 	peeked, _ := peekInitial(reader)
 	_ = client.SetReadDeadline(time.Time{})
 	target := destination.String()
-	if host := sniffHost(peeked); host != "" {
+	host := sniffHost(peeked)
+	if host != "" {
 		target = net.JoinHostPort(host, strconv.Itoa(int(destination.Port())))
 	}
+	route := Route{Opera: true}
+	if t.Route != nil {
+		route = t.Route(host, destination.Addr())
+	}
+	if route.Block {
+		return
+	}
 	dialContext, cancel := context.WithTimeout(ctx, apiTimeout)
-	upstream, err := t.Client.DialContext(dialContext, target)
+	var upstream net.Conn
+	if route.Opera {
+		upstream, err = t.Client.DialContext(dialContext, target)
+	} else {
+		// To the address the client chose, as if it had not come here.
+		upstream, err = netx.MarkedDialer(route.Mark, apiTimeout).DialContext(dialContext, "tcp4", destination.String())
+	}
 	cancel()
 	if err != nil {
 		log.Printf("tunnel %s: %s: %v", t.Name, target, err)
