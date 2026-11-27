@@ -189,6 +189,19 @@ func (t *probeTunnel) probe(ctx context.Context) (time.Duration, error) {
 	return time.Since(started), nil
 }
 
+// Check proves data flows through one pair now, with peer (the probe
+// device, so the live tunnel keeps its session). It returns the plain round
+// trip through it.
+func Check(ctx context.Context, peer *Peer, selection Selection, fwmark uint32, awg3 bool) (time.Duration, error) {
+	candidate := warpCandidate{endpoint: selection.Endpoint, profile: selection.Profile, source: candidateSource(selection.Source)}
+	tunnel, err := openProbe(peer, candidate, fwmark, awg3)
+	if err != nil {
+		return 0, err
+	}
+	defer tunnel.close()
+	return tunnel.probe(ctx)
+}
+
 // pinged is a candidate that answered the ping stage.
 type pinged struct {
 	candidate warpCandidate

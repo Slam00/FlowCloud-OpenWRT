@@ -11,6 +11,7 @@ import (
 	"runtime/debug"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"flowcloud-openwrt/internal/config"
@@ -226,7 +227,12 @@ func (d *Daemon) runWarp(ctx context.Context, t *config.Tunnel) {
 	if parallel == 0 {
 		parallel = defaultProbeParallel()
 	}
+	// The probe device runs one test at a time: two handshakes with its key
+	// would take each other's session.
+	var probeMutex sync.Mutex
 	selectBest := func(exclude string) (warp.Selection, error) {
+		probeMutex.Lock()
+		defer probeMutex.Unlock()
 		selectContext, cancel := context.WithTimeout(ctx, selectTimeout)
 		selection, err := warp.Select(selectContext, probePeer, cache, warp.Options{
 			Parallel:   parallel,
@@ -285,6 +291,7 @@ func (d *Daemon) runWarp(ctx context.Context, t *config.Tunnel) {
 	// and then the previous pair when it was working. It reports whether it
 	// fell back to previous. With nothing working it leaves the winner on
 	// the device and lets the health check decide.
+	backups := &warpBackups{}
 	connect := func(selection warp.Selection, reason string, previous *warp.Selection) (warp.Selection, bool, error) {
 		tries := append([]warp.Selection{selection}, selection.Alternates...)
 		for index, candidate := range tries {
@@ -295,18 +302,29 @@ func (d *Daemon) runWarp(ctx context.Context, t *config.Tunnel) {
 				if index > 0 {
 					reason += fmt.Sprintf("; backup %d of the round", index)
 				}
-				announce(candidate, reason)
+				// The rest of the round backs the new pair up; the
+				// previous pair, still working when it was replaced on
+				// request or for quality, comes last.
+				rest := append([]warp.Selection(nil), tries[index+1:]...)
+				if previous != nil {
+					rest = append(rest, *previous)
+				}
+				backups.setCurrent(candidate.Endpoint)
+				backups.replace(rest)
+				announce(candidate, reason+fmt.Sprintf("; backups %d", backups.count()))
 				return candidate, false, nil
 			}
 			if ctx.Err() != nil {
 				return selection, false, ctx.Err()
 			}
 			cache.SitesFailed(candidate.Endpoint)
+			backups.drop(candidate.Endpoint)
 			log.Printf("tunnel %s: no traffic through %s once applied; trying the next candidate", t.Name, candidate.Endpoint)
 		}
 		if previous != nil {
 			if err := applyOne(*previous); err == nil && carries(ctx, mark) {
 				log.Printf("tunnel %s: no candidate carried traffic; back on %s", t.Name, previous.Endpoint)
+				backups.setCurrent(previous.Endpoint)
 				d.board.tunnel(t.Name, func(status *TunnelStatus) { status.State = "up"; status.Error = "" })
 				return *previous, true, nil
 			}
@@ -314,9 +332,19 @@ func (d *Daemon) runWarp(ctx context.Context, t *config.Tunnel) {
 		if err := applyOne(selection); err != nil {
 			return selection, false, err
 		}
+		backups.setCurrent(selection.Endpoint)
+		backups.replace(nil)
 		announce(selection, reason+"; no traffic yet")
 		return selection, false, nil
 	}
+	go d.keepBackupsWarm(ctx, t.Name, backups,
+		func(checkContext context.Context, backup warp.Selection) error {
+			probeMutex.Lock()
+			defer probeMutex.Unlock()
+			_, err := warp.Check(checkContext, probePeer, backup, netx.MarkDirect, t.AWG3)
+			return err
+		},
+		selectBest)
 	switchRequests, unregister := d.switchChannel(t.Name)
 	defer unregister()
 
@@ -325,8 +353,11 @@ func (d *Daemon) runWarp(ctx context.Context, t *config.Tunnel) {
 	reconnects := 0
 	adopted, kept := d.adoptWarp(ctx, t, mark, cache)
 	if kept {
+		backups.setCurrent(adopted.Endpoint)
 		announce(adopted, "")
 	}
+	// lastCut is when the applied pair last needed a reconnect.
+	var lastCut time.Time
 	for ctx.Err() == nil {
 		var selection warp.Selection
 		var err error
@@ -433,21 +464,57 @@ func (d *Daemon) runWarp(ctx context.Context, t *config.Tunnel) {
 				// after a couple of minutes or a few MB), not a dead endpoint:
 				// the same pair from a new source port with a new handshake
 				// (Apply does both) works again at once.
-				log.Printf("tunnel %s: no traffic through %s; reconnecting from a new source port", t.Name, selection.Endpoint)
-				if applyOne(selection) == nil && carries(ctx, mark) {
-					reconnects++
-					d.board.tunnel(t.Name, func(status *TunnelStatus) {
-						status.State = "up"
-						status.Error = ""
-						status.Reconnects = reconnects
-					})
-					window.reset()
-					continue
+				// A pair cut again soon after a reconnect is being cut
+				// repeatedly: a backup is the quicker way out.
+				cutAt := time.Now()
+				if time.Since(lastCut) >= recentCut {
+					lastCut = time.Now()
+					log.Printf("tunnel %s: no traffic through %s; reconnecting from a new source port", t.Name, selection.Endpoint)
+					if applyOne(selection) == nil && carries(ctx, mark) {
+						reconnects++
+						d.board.tunnel(t.Name, func(status *TunnelStatus) {
+							status.State = "up"
+							status.Error = ""
+							status.Reconnects = reconnects
+						})
+						window.reset()
+						continue
+					}
+				} else {
+					log.Printf("tunnel %s: %s cut again within %s of a reconnect", t.Name, selection.Endpoint, recentCut)
 				}
 				if ctx.Err() != nil {
 					return
 				}
 				cache.Forget(selection.Endpoint)
+				switched := false
+				for {
+					backup, ok := backups.take()
+					if !ok {
+						break
+					}
+					if applyOne(backup) == nil && carries(ctx, mark) {
+						backup.Source = "backup"
+						backup.Latency = time.Since(cutAt)
+						backups.setCurrent(backup.Endpoint)
+						announce(backup, "; "+selection.Endpoint+" stopped passing traffic")
+						selection = backup
+						lastCut = time.Time{}
+						switched = true
+						break
+					}
+					if ctx.Err() != nil {
+						return
+					}
+					cache.SitesFailed(backup.Endpoint)
+					log.Printf("tunnel %s: backup %s carried no traffic", t.Name, backup.Endpoint)
+				}
+				if switched {
+					window.reset()
+					fresh = true
+					continue
+				}
+				lastCut = time.Time{}
 				log.Printf("tunnel %s: endpoint %s stopped passing traffic; selecting a new one", t.Name, selection.Endpoint)
 				break
 			}
