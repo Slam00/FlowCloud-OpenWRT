@@ -17,6 +17,13 @@ import (
 const (
 	TunnelWarp      = "warp"
 	TunnelInterface = "interface"
+	// TunnelOpera reaches its sections' sites through Opera VPN's free
+	// proxies (internal/opera), dialed through a WARP tunnel.
+	TunnelOpera = "opera"
+
+	// OperaPortBase + tunnel index is the transparent proxy port of an
+	// Opera tunnel.
+	OperaPortBase = 18100
 
 	ActionTunnel = "tunnel"
 	ActionBlock  = "block"
@@ -72,6 +79,11 @@ type Tunnel struct {
 	AvoidColos []string
 	// AWG3 enables the AmneziaWG 3 client parameters on a WARP tunnel.
 	AWG3 bool
+	// Country is an Opera tunnel's exit region (EU, AM or AS); Via names the
+	// WARP tunnel that carries its connections to Opera ("" picks the first
+	// enabled one).
+	Country string
+	Via     string
 	// Index is 1-based and stable for a given config: it selects the fwmark
 	// and the routing table.
 	Index int
@@ -159,6 +171,25 @@ func FromUCI(sections []*uci.Section) (*Config, error) {
 			return nil, fmt.Errorf("tunnels %s and %s use the same device %s", owner, tunnel.Name, tunnel.Device)
 		}
 		devices[tunnel.Device] = tunnel.Name
+	}
+	// An Opera tunnel reaches Opera through another tunnel: Opera's proxy
+	// addresses are blocked in Russia. By default the first enabled WARP one.
+	for _, tunnel := range config.Tunnels {
+		if tunnel.Type != TunnelOpera {
+			continue
+		}
+		if tunnel.Via == "" {
+			for _, other := range config.Tunnels {
+				if other.Type == TunnelWarp && other.Enabled {
+					tunnel.Via = other.Name
+					break
+				}
+			}
+		}
+		via := config.Tunnel(tunnel.Via)
+		if via == nil || via.Type == TunnelOpera {
+			return nil, fmt.Errorf("tunnel %s: needs a WARP or interface tunnel to reach Opera (option via)", tunnel.Name)
+		}
 	}
 	for index, section := range config.Sections {
 		section.Index = index
@@ -273,6 +304,19 @@ func readTunnel(section *uci.Section) (*Tunnel, error) {
 		if tunnel.Device == "" {
 			return nil, fmt.Errorf("tunnel %s: choose a network interface", tunnel.Name)
 		}
+	case TunnelOpera:
+		// No device: its traffic goes to a local transparent proxy.
+		tunnel.Device = "opera-" + tunnel.Name
+		if len(tunnel.Device) > 15 {
+			tunnel.Device = tunnel.Device[:15]
+		}
+		tunnel.Country = strings.ToUpper(section.Get("country", "EU"))
+		switch tunnel.Country {
+		case "EU", "AM", "AS":
+		default:
+			return nil, fmt.Errorf("tunnel %s: country must be EU, AM or AS", tunnel.Name)
+		}
+		tunnel.Via = section.Get("via", "")
 	default:
 		return nil, fmt.Errorf("tunnel %s: unknown type %q", tunnel.Name, tunnel.Type)
 	}

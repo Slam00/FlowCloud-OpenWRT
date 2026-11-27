@@ -18,6 +18,7 @@ func TestRender(t *testing.T) {
 		},
 		DNSTimeout:  time.Hour,
 		ZapretQueue: 300,
+		Redirects:   []Redirect{{Mark: 0x03000000, Port: 18103}},
 	}.Render()
 	for _, want := range []string{
 		"delete table inet flowcloud",
@@ -35,6 +36,8 @@ func TestRender(t *testing.T) {
 		"tcp sport { 80, 443 } ct reply packets 1-12 counter queue num 300 bypass",
 		"meta mark and 0x40000000 != 0 return",
 		"type filter hook output priority -401",
+		"meta mark and 0x0f000000 == 0x03000000 meta l4proto tcp counter redirect to :18103",
+		"meta mark and 0x0f000000 == 0x03000000 udp dport 443 counter drop",
 		"meta mark and 0x40000000 != 0 notrack",
 		"type filter hook prerouting priority -101",
 		"chain mss_reply_01000000 {}",

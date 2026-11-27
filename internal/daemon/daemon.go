@@ -226,6 +226,12 @@ func (d *Daemon) runOnce(ctx context.Context, updateLists <-chan struct{}) error
 			used[section.Tunnel] = true
 		}
 	}
+	// An Opera tunnel needs the tunnel that carries it.
+	for _, tunnel := range cfg.Tunnels {
+		if tunnel.Type == config.TunnelOpera && used[tunnel.Name] && tunnel.Enabled {
+			used[tunnel.Via] = true
+		}
+	}
 	d.mutex.Unlock()
 	var wait sync.WaitGroup
 	for _, tunnel := range cfg.Tunnels {
@@ -253,6 +259,8 @@ func (d *Daemon) runOnce(ctx context.Context, updateLists <-chan struct{}) error
 				d.runWarp(ctx, tunnel)
 			case config.TunnelInterface:
 				d.runInterface(ctx, tunnel)
+			case config.TunnelOpera:
+				d.runOpera(ctx, tunnel)
 			}
 		}(tunnel)
 	}
@@ -404,6 +412,7 @@ func (d *Daemon) ruleset() nft.Ruleset {
 		Bypass:           d.bypassPrefixes(),
 		DNSTimeout:       d.cfg.Settings.MinSetTimeout,
 		ZapretQueue:      d.zapretQueue(),
+		Redirects:        d.operaRedirects(),
 	}
 	for _, section := range d.activeSections() {
 		mark, block := d.sectionMark(section)

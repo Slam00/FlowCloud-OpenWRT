@@ -44,6 +44,15 @@ type Ruleset struct {
 	// ZapretQueue is the NFQUEUE of nfqws2; 0 leaves "zapret" sections
 	// going direct without DPI bypass.
 	ZapretQueue int
+	// Redirects send the TCP of a tunnel mark to a local transparent proxy
+	// (Opera tunnels); their QUIC is dropped so apps fall back to TCP.
+	Redirects []Redirect
+}
+
+// Redirect is one tunnel mark served by a local proxy port.
+type Redirect struct {
+	Mark uint32
+	Port int
 }
 
 // zapretPackets is how many packets of a flow nfqws2 sees in each direction:
@@ -184,6 +193,20 @@ func (r Ruleset) Render() string {
 		// them: LAN clients failed while the router's own tests passed.
 		b.WriteString("\tchain zapret_notrack {\n\t\ttype filter hook output priority -401; policy accept;\n")
 		fmt.Fprintf(&b, "\t\tmeta mark and %s != 0 notrack\n", desync)
+		b.WriteString("\t}\n")
+	}
+
+	if len(r.Redirects) > 0 {
+		// After classify (mangle) has set the mark of new connections.
+		b.WriteString("\tchain proxy_redirect {\n\t\ttype nat hook prerouting priority dstnat; policy accept;\n")
+		for _, redirect := range r.Redirects {
+			fmt.Fprintf(&b, "\t\tmeta mark and %s == 0x%08x meta l4proto tcp counter redirect to :%d\n", mask, redirect.Mark, redirect.Port)
+		}
+		b.WriteString("\t}\n")
+		b.WriteString("\tchain proxy_quic {\n\t\ttype filter hook prerouting priority mangle + 5; policy accept;\n")
+		for _, redirect := range r.Redirects {
+			fmt.Fprintf(&b, "\t\tmeta mark and %s == 0x%08x udp dport 443 counter drop\n", mask, redirect.Mark)
+		}
 		b.WriteString("\t}\n")
 	}
 

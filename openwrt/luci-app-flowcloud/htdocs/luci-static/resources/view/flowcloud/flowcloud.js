@@ -217,7 +217,7 @@ function renderStatus(status, warpSwitch) {
 	var tunnelRows = (status.tunnels || []).map(function(t) {
 		return E('tr', { 'class': 'tr' }, [
 			E('td', { 'class': 'td' }, E('strong', {}, t.name)),
-			E('td', { 'class': 'td' }, t.type == 'warp' ? 'WARP' : _('Интерфейс')),
+			E('td', { 'class': 'td' }, t.type == 'warp' ? 'WARP' : (t.type == 'opera' ? 'Opera' : _('Интерфейс'))),
 			E('td', { 'class': 'td' }, badge(STATE_LABELS[t.state] || t.state, STATE_COLORS[t.state] || '#888')),
 			E('td', { 'class': 'td' }, [
 				E('code', {}, t.endpoint || '—'),
@@ -420,7 +420,8 @@ return view.extend({
 
 		o = s.option(form.ListValue, 'tunnel', _('Туннель'));
 		uci.sections('flowcloud', 'tunnel').forEach(function(tunnel) {
-			var label = tunnel['.name'] + (tunnel.type == 'interface' ? ' (' + (tunnel.interface || '?') + ')' : ' (WARP)');
+			var label = tunnel['.name'] + (tunnel.type == 'interface' ? ' (' + (tunnel.interface || '?') + ')' :
+				(tunnel.type == 'opera' ? ' (Opera ' + (tunnel.country || 'EU') + ')' : ' (WARP)'));
 			o.value(tunnel['.name'], label);
 		});
 		o.depends('action', 'tunnel');
@@ -466,6 +467,7 @@ return view.extend({
 		o = s.option(form.ListValue, 'type', _('Тип'));
 		o.value('warp', _('Cloudflare WARP (автоподбор сервера)'));
 		o.value('interface', _('Существующий интерфейс'));
+		o.value('opera', _('Opera VPN (выход за границей, для геоблоков)'));
 		o.default = 'warp';
 
 		o = s.option(widgets.NetworkSelect, 'interface', _('Интерфейс'),
@@ -525,6 +527,23 @@ return view.extend({
 		o.value('DME', _('DME — Москва'));
 		o.value('LED', _('LED — Санкт-Петербург'));
 		o.depends('type', 'warp');
+
+		o = s.option(form.ListValue, 'country', _('Регион выхода'),
+			_('Бесплатные прокси Opera VPN: сайты видят адрес Opera в этом регионе, поэтому открываются сервисы, закрытые для России (Gemini, ChatGPT, Claude и другие). Только TCP: QUIC для секций этого туннеля отключается, приложения переходят на TCP. Скорость около 10–15 Мбит/с — для видео не подходит.'));
+		o.value('EU', _('Европа'));
+		o.value('AM', _('Америка'));
+		o.value('AS', _('Азия'));
+		o.default = 'EU';
+		o.depends('type', 'opera');
+
+		o = s.option(form.ListValue, 'via', _('Подключаться через'),
+			_('Адреса Opera VPN в России заблокированы, поэтому до них FlowCloud ходит через другой туннель — обычно WARP.'));
+		o.value('', _('первый WARP-туннель'));
+		uci.sections('flowcloud', 'tunnel').forEach(function(tunnel) {
+			if (tunnel.type != 'opera')
+				o.value(tunnel['.name'], tunnel['.name']);
+		});
+		o.depends('type', 'opera');
 
 		o = s.option(form.Flag, 'fail_closed', _('Не пускать мимо туннеля'),
 			_('Если туннель недоступен, трафик его секций блокируется, а не идёт напрямую.'));

@@ -101,6 +101,19 @@ func (b *statusBoard) tunnel(name string, change func(*TunnelStatus)) {
 	})
 }
 
+// tunnelState returns a tunnel's current state, "" when unknown.
+func (b *statusBoard) tunnelState(name string) string {
+	state := ""
+	b.update(func(status *Status) {
+		for _, tunnel := range status.Tunnels {
+			if tunnel.Name == name {
+				state = tunnel.State
+			}
+		}
+	})
+	return state
+}
+
 func (b *statusBoard) write() {
 	b.mutex.Lock()
 	b.status.UpdatedAt = time.Now().Unix()
