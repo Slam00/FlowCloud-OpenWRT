@@ -70,6 +70,8 @@ type Tunnel struct {
 	// AvoidColos are Cloudflare locations (IATA codes from cdn-cgi/trace)
 	// chosen only when no other endpoint opens the test URLs.
 	AvoidColos []string
+	// AWG3 enables the AmneziaWG 3 client parameters on a WARP tunnel.
+	AWG3 bool
 	// Index is 1-based and stable for a given config: it selects the fwmark
 	// and the routing table.
 	Index int
@@ -224,6 +226,7 @@ func readTunnel(section *uci.Section) (*Tunnel, error) {
 		Device:         section.Get("interface", ""),
 		ProbeParallel:  0, // 0: chosen by the daemon from the router's RAM
 		FailClosed:     section.Bool("fail_closed", false),
+		AWG3:           section.Bool("awg3", true),
 		HealthInterval: 15 * time.Second,
 		MaxPingMs:      300,
 		MaxLossPct:     30,

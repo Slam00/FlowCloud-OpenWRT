@@ -163,7 +163,7 @@ func (d *Daemon) runWarp(ctx context.Context, t *config.Tunnel) {
 	accountPath := filepath.Join(directory, t.Name+".json")
 	keyPath := filepath.Join(directory, t.Name+".key")
 	cache := warp.NewEndpointCache(filepath.Join(directory, t.Name+"-endpoints.json"))
-	kernel := &tunnel.Kernel{Device: t.Device, KeyFile: keyPath}
+	kernel := &tunnel.Kernel{Device: t.Device, KeyFile: keyPath, AWG3: t.AWG3}
 	mark := netx.TunnelMark(t.Index)
 	d.tunnelDown(t, "starting", "")
 
@@ -234,6 +234,7 @@ func (d *Daemon) runWarp(ctx context.Context, t *config.Tunnel) {
 			Exclude:    exclude,
 			TestURLs:   t.TestURLs,
 			AvoidColos: t.AvoidColos,
+			AWG3:       t.AWG3,
 		})
 		cancel()
 		// Return the probes' memory before the tunnel settles down.

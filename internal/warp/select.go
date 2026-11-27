@@ -63,6 +63,8 @@ type Options struct {
 	// locations taken only when no other endpoint opens every test URL.
 	TestURLs   []string
 	AvoidColos []string
+	// AWG3 adds the AmneziaWG 3 client parameters (awg3.go) to the probes.
+	AWG3 bool
 }
 
 const (
@@ -112,7 +114,7 @@ func (t *probeTunnel) close() {
 	}
 }
 
-func openProbe(peer *Peer, candidate warpCandidate, fwmark uint32) (*probeTunnel, error) {
+func openProbe(peer *Peer, candidate warpCandidate, fwmark uint32, awg3 bool) (*probeTunnel, error) {
 	if err := candidate.profile.validate(); err != nil {
 		return nil, fmt.Errorf("profile %s: %w", candidate.profile.Name, err)
 	}
@@ -126,13 +128,15 @@ func openProbe(peer *Peer, candidate warpCandidate, fwmark uint32) (*probeTunnel
 		lines = append(lines, "fwmark="+strconv.FormatUint(uint64(fwmark), 10))
 	}
 	lines = append(lines, candidate.profile.uapi()...)
+	// Probes test an endpoint with the same obfuscation the tunnel will use.
+	lines = append(lines, awg3UAPI(awg3, mrand.New(mrand.NewSource(time.Now().UnixNano())))...)
 	lines = append(lines,
 		"replace_peers=true",
 		"public_key="+KeyHex(peer.PublicKey),
 		"endpoint="+candidate.endpoint,
 		"replace_allowed_ips=true",
 		"allowed_ip=0.0.0.0/0",
-		"persistent_keepalive_interval=25",
+		"persistent_keepalive_interval="+Keepalive(awg3),
 	)
 	if err := dev.IpcSet(strings.Join(lines, "\n") + "\n\n"); err != nil {
 		dev.Close()
@@ -453,7 +457,7 @@ func pingStage(ctx context.Context, peer *Peer, cache *EndpointCache, opts Optio
 				defer workers.Done()
 				defer func() { <-slots }()
 				var rtt time.Duration
-				tunnel, err := openProbe(peer, candidate, opts.Fwmark)
+				tunnel, err := openProbe(peer, candidate, opts.Fwmark, opts.AWG3)
 				if err == nil {
 					rtt, err = tunnel.probe(roundContext)
 				}
@@ -502,7 +506,7 @@ func pingStage(ctx context.Context, peer *Peer, cache *EndpointCache, opts Optio
 // With deferAvoided, an endpoint exiting in an avoided location returns
 // after the location check with skipped set and no site results.
 func evaluate(ctx context.Context, peer *Peer, candidate warpCandidate, opts Options, addresses map[string]string, deferAvoided bool) (Selection, bool, error) {
-	tunnel, err := openProbe(peer, candidate, opts.Fwmark)
+	tunnel, err := openProbe(peer, candidate, opts.Fwmark, opts.AWG3)
 	if err != nil {
 		return Selection{}, false, err
 	}

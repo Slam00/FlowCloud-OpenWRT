@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	mrand "math/rand"
 	"strings"
 	"time"
 
@@ -22,6 +23,9 @@ const MTU = 1280
 type Kernel struct {
 	Device  string
 	KeyFile string
+	// AWG3 applies the AmneziaWG 3 client parameters (warp/awg3.go); off, it
+	// resets them on a device that had them.
+	AWG3 bool
 }
 
 // Supported reports whether the kernel can create AmneziaWG interfaces.
@@ -74,8 +78,9 @@ func (k *Kernel) Apply(peer *warp.Peer, selection warp.Selection, publicKey stri
 	_, _ = system.Run("awg", "set", k.Device, "peer", publicKey, "remove")
 	args := []string{"set", k.Device, "listen-port", "0"}
 	args = append(args, selection.Profile.AWGArgs()...)
+	args = append(args, warp.AWG3Args(k.AWG3, mrand.New(mrand.NewSource(time.Now().UnixNano())))...)
 	args = append(args, "peer", publicKey, "endpoint", selection.Endpoint,
-		"allowed-ips", "0.0.0.0/0", "persistent-keepalive", "25")
+		"allowed-ips", "0.0.0.0/0", "persistent-keepalive", warp.Keepalive(k.AWG3))
 	_, err := system.Run("awg", args...)
 	return err
 }

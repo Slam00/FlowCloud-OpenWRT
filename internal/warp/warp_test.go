@@ -4,6 +4,7 @@ import (
 	mrand "math/rand"
 	"net/netip"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -79,11 +80,13 @@ func TestProfilesAreAcceptedByDevice(t *testing.T) {
 		profiles = append(profiles, awgProfile{Name: variant.name, Jc: 4, Jmin: 20, Jmax: 90, I1: chain})
 	}
 	for _, profile := range profiles {
-		tunnel, err := openProbe(peer, warpCandidate{endpoint: "127.0.0.1:9", profile: profile}, 0)
-		if err != nil {
-			t.Fatalf("profile %s rejected: %v", profile.Name, err)
+		for _, awg3 := range []bool{false, true} {
+			tunnel, err := openProbe(peer, warpCandidate{endpoint: "127.0.0.1:9", profile: profile}, 0, awg3)
+			if err != nil {
+				t.Fatalf("profile %s (awg3 %v) rejected: %v", profile.Name, awg3, err)
+			}
+			tunnel.close()
 		}
-		tunnel.close()
 		if args := profile.AWGArgs(); args[len(args)-2] != "i1" || args[len(args)-1] != profile.I1 {
 			t.Fatalf("profile %s: awg arguments %q", profile.Name, args)
 		}
@@ -149,5 +152,39 @@ func TestAlternatesBackUpTheWinner(t *testing.T) {
 	}
 	if got[1].SitesOK != -1 || got[1].Colo != "ARN" {
 		t.Fatalf("an untested backup must say so and carry its pool location: %+v", got[1])
+	}
+}
+
+func TestAWG3Args(t *testing.T) {
+	rng := mrand.New(mrand.NewSource(1))
+	on := AWG3Args(true, rng)
+	off := AWG3Args(false, rng)
+	if len(on) != len(off) || len(on)%2 != 0 {
+		t.Fatalf("on %d args, off %d", len(on), len(off))
+	}
+	values := func(args []string) map[string]string {
+		result := map[string]string{}
+		for index := 0; index < len(args); index += 2 {
+			result[args[index]] = args[index+1]
+		}
+		return result
+	}
+	onValues, offValues := values(on), values(off)
+	if onValues["random-trailers"] != "on" || offValues["random-trailers"] != "off" {
+		t.Fatal("random trailers must follow the switch")
+	}
+	if onValues["content-padding-addition"] != "10-100" || offValues["content-padding-addition"] != "0" {
+		t.Fatal("content padding must be set or reset")
+	}
+	if !strings.HasPrefix(onValues["i2"], "<b 0x") || offValues["i2"] != "" {
+		t.Fatal("decoys must be set or cleared")
+	}
+	for name := range onValues {
+		if strings.Contains(name, "_") {
+			t.Fatalf("the kernel's awg tool takes %q only with hyphens", name)
+		}
+	}
+	if Keepalive(true) != "25-35" || Keepalive(false) != "25" {
+		t.Fatal("keepalive")
 	}
 }
