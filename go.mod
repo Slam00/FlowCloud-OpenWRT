@@ -5,6 +5,7 @@ go 1.25.0
 require (
 	github.com/amnezia-vpn/amneziawg-go/v3 v3.1.20260828
 	golang.org/x/crypto v0.46.0
+	golang.org/x/net v0.48.0
 )
 
 require (
@@ -16,7 +17,6 @@ require (
 	github.com/ncruces/go-dns v1.3.2 // indirect
 	github.com/things-go/go-socks5 v0.1.0 // indirect
 	golang.org/x/crypto/x509roots/fallback v0.0.0-20251210140736-7dacc380ba00 // indirect
-	golang.org/x/net v0.48.0 // indirect
 	golang.org/x/sys v0.39.0 // indirect
 	golang.org/x/time v0.9.0 // indirect
 	golang.zx2c4.com/wintun v0.0.0-20230126152724-0fa3db229ce2 // indirect
