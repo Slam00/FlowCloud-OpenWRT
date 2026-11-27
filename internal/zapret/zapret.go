@@ -124,6 +124,11 @@ func (p *Process) Start(parent context.Context, args []string) {
 	p.mutex.Unlock()
 	go func() {
 		defer close(done)
+		for _, arg := range args {
+			if strings.HasPrefix(arg, "--qnum=") {
+				killStray(p.Binary, arg)
+			}
+		}
 		delay := time.Second
 		for ctx.Err() == nil {
 			started := time.Now()

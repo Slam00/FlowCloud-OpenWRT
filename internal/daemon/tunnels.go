@@ -470,7 +470,7 @@ func (d *Daemon) runWarp(ctx context.Context, t *config.Tunnel) {
 				if time.Since(lastCut) >= recentCut {
 					lastCut = time.Now()
 					log.Printf("tunnel %s: no traffic through %s; reconnecting from a new source port", t.Name, selection.Endpoint)
-					if applyOne(selection) == nil && carries(ctx, mark) {
+					if applyOne(selection) == nil && carriesWithin(ctx, mark, recoveryAttempts) {
 						reconnects++
 						d.board.tunnel(t.Name, func(status *TunnelStatus) {
 							status.State = "up"
@@ -493,7 +493,7 @@ func (d *Daemon) runWarp(ctx context.Context, t *config.Tunnel) {
 					if !ok {
 						break
 					}
-					if applyOne(backup) == nil && carries(ctx, mark) {
+					if applyOne(backup) == nil && carriesWithin(ctx, mark, recoveryAttempts) {
 						backup.Source = "backup"
 						backup.Latency = time.Since(cutAt)
 						backups.setCurrent(backup.Endpoint)
@@ -585,10 +585,19 @@ const (
 // carries reports whether traffic flows through the tunnel with this mark
 // shortly after an apply.
 func carries(ctx context.Context, mark uint32) bool {
+	return carriesWithin(ctx, mark, carryAttempts)
+}
+
+// recoveryAttempts: while the tunnel is down, a reconnect or a backup that
+// does not answer within about four seconds is given up for the next one; a
+// working pair answers within one or two.
+const recoveryAttempts = 2
+
+func carriesWithin(ctx context.Context, mark uint32, attempts int) bool {
 	if !sleep(ctx, carryGrace) {
 		return false
 	}
-	for attempt := 0; attempt < carryAttempts; attempt++ {
+	for attempt := 0; attempt < attempts; attempt++ {
 		if _, err := tunnel.Ping(ctx, mark, carryTimeout); err == nil {
 			return true
 		}
@@ -613,8 +622,10 @@ func orDash(value string) string {
 const (
 	stallTick   = 2 * time.Second
 	stallWindow = 4 * time.Second
-	// stallMinSent ignores keepalives and stray packets.
-	stallMinSent = 600
+	// stallMinSent: a few SYN retransmits of a client already qualify (600
+	// missed Telegram reconnecting for 20 s); a stray keepalive costs only
+	// the two confirming pings.
+	stallMinSent = 150
 )
 
 // pauseWatching waits one health interval like pause, and returns
